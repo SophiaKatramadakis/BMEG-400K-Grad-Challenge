@@ -1,0 +1,396 @@
+%% ===== GCAssignment2_Filtering: Design + apply filters to ALL data, then plot RAW vs FILTERED =====
+% Uses the SAME participants/trials/windows as your Assignment 1 script for consistency.
+% Filter style per course: "Butterworth fourth-order lagless"
+%   -> design a 2nd-order butter() and apply filtfilt() (zero-phase, effective 4th order)
+
+clear; clc;
+
+%% 1) Load MAT file
+filePath = "/Users/sophiakatramadakis/Documents/MATLAB/GrandChallengeData.mat"; % <-- update if needed
+S = load(filePath);
+
+disp("Top-level variables in MAT file:");
+disp(fieldnames(S))
+
+%% 2) Assign labels + auto-find raw sensor struct (same logic as Assignment 1)
+if ~isfield(S, "clean_labels")
+    error("Expected S.clean_labels but it wasn't found. Check fieldnames(S).");
+end
+labels = S.clean_labels;
+
+names = fieldnames(S);
+raw = [];
+
+for k = 1:numel(names)
+    nm = names{k};
+    if strcmp(nm, "clean_labels"), continue; end
+    if ~isstruct(S.(nm)), continue; end
+    if ~isfield(S.(nm), "P1960"), continue; end
+
+    trialFields = fieldnames(S.(nm).P1960);
+    if isempty(trialFields), continue; end
+
+    t1 = trialFields{1};
+    if isstruct(S.(nm).P1960.(t1))
+        sf = fieldnames(S.(nm).P1960.(t1));
+        if any(strcmp(sf,"Back")) && any(strcmp(sf,"ECG")) && any(strcmp(sf,"GSS"))
+            raw = S.(nm);
+            fprintf("Using RAW sensor struct: S.%s\n", nm);
+            break
+        end
+    end
+end
+
+if isempty(raw)
+    error("Could not auto-find the raw sensor struct. Paste fieldnames(S) and I’ll point to it.");
+end
+
+%% ===================== FILTER DESIGN PARAMETERS (what you will justify in your writeup) =====================
+% IMPORTANT: these are filter TYPES + cutoffs. All are applied as lagless Butterworth via filtfilt.
+
+% --- IMU (accel + gyro) ---
+% Choice: LOW-PASS at 20 Hz
+% Rationale: most human movement/fall kinematics are concentrated at low frequencies;
+%            low-pass reduces high-frequency sensor noise while preserving event timing (filtfilt).
+IMU.lowpass_fc = 20;      % Hz
+
+% --- ECG ---
+% Choice: BAND-PASS 0.5–40 Hz + (optional) NOTCH around mains (60 Hz)
+% Rationale: 0.5–40 keeps the main ECG morphology; notch reduces mains interference if present.
+ECG.bandpass_f1 = 0.5;    % Hz
+ECG.bandpass_f2 = 150;     % Hz
+ECG.use_notch   = true;
+ECG.notch_f1    = 50;     % Hz
+ECG.notch_f2    = 70;     % Hz
+
+% --- GSR / GVR (your file uses "GSS") ---
+% Choice: LOW-PASS at 1 Hz
+% Rationale: skin conductance changes are slow (tonic/phasic), high-frequency content is mostly noise/motion artifact.
+GSR.lowpass_fc = 1;       % Hz
+
+%% 3) Apply filters to ALL data (create parallel struct raw_filt with same layout)
+raw_filt = raw;  % overwrite each sensor matrix with filtered signals (time column preserved)
+
+participants = string(fieldnames(raw));
+
+for p = 1:numel(participants)
+    pID = participants(p);
+
+    trialNames = string(fieldnames(raw.(pID)));
+    for tt = 1:numel(trialNames)
+        tr = trialNames(tt);
+
+        X = raw.(pID).(tr);
+
+        % ---- Back IMU ----
+        if isfield(X,"Back")
+            raw_filt.(pID).(tr).Back = filterIMU_Matrix(X.Back, IMU.lowpass_fc);
+        end
+
+        % ---- Thigh IMUs ----
+        if isfield(X,"Left_Thigh")
+            raw_filt.(pID).(tr).Left_Thigh = filterIMU_Matrix(X.Left_Thigh, IMU.lowpass_fc);
+        end
+        if isfield(X,"Right_Thigh")
+            raw_filt.(pID).(tr).Right_Thigh = filterIMU_Matrix(X.Right_Thigh, IMU.lowpass_fc);
+        end
+
+        % ---- ECG ----
+        if isfield(X,"ECG")
+            raw_filt.(pID).(tr).ECG = filterECG_Matrix(X.ECG, ECG.bandpass_f1, ECG.bandpass_f2, ECG.use_notch, ECG.notch_f1, ECG.notch_f2);
+        end
+
+        % ---- GSR/GVR (GSS) ----
+        if isfield(X,"GSS")
+            raw_filt.(pID).(tr).GSS = filterGSR_Matrix(X.GSS, GSR.lowpass_fc);
+        end
+    end
+end
+
+disp("Filtering complete: raw_filt created (same structure as raw).");
+
+%% 4) Use the SAME participants and windows as Assignment 1 to plot RAW vs FILTERED side-by-side
+participantsToPlot = ["P1960","P2070","P2995"];
+
+perturbTrial = "Slip";   % near-fall + fall blocks inside Slip
+adlTrial     = "Walk";   % first 20 seconds
+standTrial   = "Stand";  % first 60 seconds (change to 20 if you want)
+
+for pID = participantsToPlot
+    fprintf("\n=== Plotting participant %s (RAW vs FILTERED) ===\n", pID);
+
+    % --- Slip: near-fall and fall windows based on labels ---
+    if ~isfield(labels, pID) || ~isfield(labels.(pID), perturbTrial)
+        warning("No labels found for %s %s. Skipping perturb plots.", pID, perturbTrial);
+    else
+        T = labels.(pID).(perturbTrial);  % [label, time_ms, group]
+
+        % Near-fall: first group==1 block
+        nf_rows = find(T(:,3)==1);
+        if numel(nf_rows) >= 3
+            nf_block = T(nf_rows(1:3),:);
+            t_nf0 = nf_block(1,2)/1000;
+            t_nf1 = nf_block(3,2)/1000 + 2;
+
+            plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, perturbTrial, t_nf0, t_nf1, true, ...
+                "NEAR-FALL window (Slip) RAW vs FILTERED");
+        else
+            warning("No near-fall block (group 1) found in %s %s.", pID, perturbTrial);
+        end
+
+        % Fall: first group==4 block
+        fall_rows = find(T(:,3)==4);
+        if numel(fall_rows) >= 4
+            fall_block = T(fall_rows(1:4),:);
+            t_f0 = fall_block(1,2)/1000;
+            t_f1 = fall_block(4,2)/1000 + 2;
+
+            plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, perturbTrial, t_f0, t_f1, true, ...
+                "FALL window (Slip) RAW vs FILTERED");
+        else
+            warning("No fall block (group 4) found in %s %s.", pID, perturbTrial);
+        end
+    end
+
+    % --- Walk: first 20 seconds ---
+    if isfield(raw, pID)
+        plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, adlTrial, 0, 20, false, ...
+            "ADL window (Walk) first 20s RAW vs FILTERED");
+    else
+        warning("Participant %s not found in raw sensor struct.", pID);
+    end
+
+    % --- Stand: first 60 seconds (edit to 20 if you prefer) ---
+    if isfield(raw, pID)
+        plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, standTrial, 0, 60, false, ...
+            "ADL window (Stand) first 60s RAW vs FILTERED");
+    else
+        warning("Participant %s not found in raw sensor struct.", pID);
+    end
+end
+
+%% ================== Local Functions (MUST be at end of file) ==================
+
+function M_f = filterIMU_Matrix(M, fc_lowpass)
+% M is Nx7: [t, ax, ay, az, wx, wy, wz]
+% Apply lagless 4th-order Butterworth low-pass (design order 2 + filtfilt)
+    t = M(:,1);
+    sig = M(:,2:7);
+
+    Fs = estimateFs(t);
+
+    % guard for short signals
+    if size(sig,1) < 10
+        M_f = M;
+        return
+    end
+
+    Wn = fc_lowpass/(Fs/2);
+    Wn = min(max(Wn, 0.0001), 0.9999);
+
+    [b,a] = butter(2, Wn, 'low');   % 2nd order design
+    sig_f = filtfilt(b,a,sig);      % lagless -> effective 4th order
+
+    M_f = [t sig_f];
+end
+
+function M_f = filterECG_Matrix(M, f1, f2, use_notch, notch_f1, notch_f2)
+% M is Nx2: [t, ecg]
+% Apply lagless 4th-order Butterworth band-pass (design order 2 + filtfilt)
+% Optionally apply lagless notch (band-stop) for mains.
+
+    t = M(:,1);
+    x = M(:,2);
+
+    Fs = estimateFs(t);
+
+    if numel(x) < 10
+        M_f = M;
+        return
+    end
+
+    % Band-pass
+    Wn = [f1 f2]/(Fs/2);
+    Wn(1) = max(Wn(1), 0.0001);
+    Wn(2) = min(Wn(2), 0.9999);
+
+    [bBP,aBP] = butter(2, Wn, 'bandpass');
+    x_f = filtfilt(bBP,aBP,x);
+
+    % Notch (band-stop) if requested
+    if use_notch
+        WnN = [notch_f1 notch_f2]/(Fs/2);
+        WnN(1) = max(WnN(1), 0.0001);
+        WnN(2) = min(WnN(2), 0.9999);
+        if WnN(2) > WnN(1)
+            [bN,aN] = butter(2, WnN, 'stop');
+            x_f = filtfilt(bN,aN,x_f);
+        end
+    end
+
+    M_f = [t x_f];
+end
+
+function M_f = filterGSR_Matrix(M, fc_lowpass)
+% M is Nx2: [t, gsr]  (your dataset uses "GSS")
+% Apply lagless 4th-order Butterworth low-pass (design order 2 + filtfilt)
+    t = M(:,1);
+    x = M(:,2);
+
+    Fs = estimateFs(t);
+
+    if numel(x) < 10
+        M_f = M;
+        return
+    end
+
+    Wn = fc_lowpass/(Fs/2);
+    Wn = min(max(Wn, 0.0001), 0.9999);
+
+    [b,a] = butter(2, Wn, 'low');
+    x_f = filtfilt(b,a,x);
+
+    M_f = [t x_f];
+end
+
+function Fs = estimateFs(t)
+% Estimate sampling rate from time vector (seconds)
+    dt = diff(t);
+    dt = dt(isfinite(dt) & dt>0);
+    if isempty(dt)
+        Fs = 1000; % fallback
+    else
+        Fs = 1/median(dt);
+    end
+end
+
+function plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, trialBaseName, t0, t1, showMarkers, subtitleTxt)
+% Makes one figure with 5 rows x 2 columns:
+%   Left column  = RAW
+%   Right column = FILTERED
+% Rows: Back IMU |a|,|w| ; L thigh |a|,|w| ; R thigh |a|,|w| ; ECG ; GSS
+%
+% Markers (L1..L5) added if showMarkers == true
+
+    % Resolve trial field name (handles Slip_2 etc, picks last match)
+    trialFields = string(fieldnames(raw.(pID)));
+    if any(strcmp(trialFields, trialBaseName))
+        trialField = trialBaseName;
+    else
+        hits = trialFields(contains(trialFields, trialBaseName, 'IgnoreCase', true));
+        if isempty(hits)
+            error("Trial '%s' not found in sensor data for %s.", trialBaseName, pID);
+        end
+        trialField = hits(end);
+    end
+
+    Xr  = raw.(pID).(trialField);
+    Xf  = raw_filt.(pID).(trialField);
+
+    % Marker times
+    timing_s = []; timingLabel = [];
+    if showMarkers
+        base = regexprep(trialBaseName, "_\d+$", "");
+        if isfield(labels.(pID), base)
+            T = labels.(pID).(base);
+            timingLabel = T(:,1);
+            timing_s = T(:,2)/1000;
+        end
+    end
+
+    crop = @(M) M(M(:,1)>=t0 & M(:,1)<=t1, :);
+
+    % Crop RAW
+    Br = crop(Xr.Back);  Lr = crop(Xr.Left_Thigh);  Rr = crop(Xr.Right_Thigh);
+    Er = crop(Xr.ECG);   Gr = crop(Xr.GSS);
+
+    % Crop FILTERED
+    Bf = crop(Xf.Back);  Lf = crop(Xf.Left_Thigh);  Rf = crop(Xf.Right_Thigh);
+    Ef = crop(Xf.ECG);   Gf = crop(Xf.GSS);
+
+    % Magnitudes
+    aBr = vecnorm(Br(:,2:4),2,2); wBr = vecnorm(Br(:,5:7),2,2);
+    aLr = vecnorm(Lr(:,2:4),2,2); wLr = vecnorm(Lr(:,5:7),2,2);
+    aRr = vecnorm(Rr(:,2:4),2,2); wRr = vecnorm(Rr(:,5:7),2,2);
+
+    aBf = vecnorm(Bf(:,2:4),2,2); wBf = vecnorm(Bf(:,5:7),2,2);
+    aLf = vecnorm(Lf(:,2:4),2,2); wLf = vecnorm(Lf(:,5:7),2,2);
+    aRf = vecnorm(Rf(:,2:4),2,2); wRf = vecnorm(Rf(:,5:7),2,2);
+
+    figure('Color','w');
+    tl = tiledlayout(5,2,'TileSpacing','compact','Padding','compact');
+    title(tl, pID + " | " + trialField + " | " + subtitleTxt + sprintf(" (%.1f–%.1fs)", t0, t1));
+
+    % ---- Row 1: Back ----
+    ax11 = nexttile;  % RAW back
+    h1 = plot(Br(:,1), aBr); hold on;
+    h2 = plot(Br(:,1), wBr);
+    ylabel("Back |a| (m/s^2), |w| (deg/s)");
+    title("RAW");
+    addLines(timing_s, timingLabel, t0, t1);
+
+    ax12 = nexttile;  % FILTERED back
+    plot(Bf(:,1), aBf); hold on;
+    plot(Bf(:,1), wBf);
+    title("FILTERED");
+    addLines(timing_s, timingLabel, t0, t1);
+
+    % Only one legend for IMU traces (kept clean)
+    lg = legend(ax11, [h1 h2], "|a|", "|w|", "Location", "northoutside", "Orientation", "horizontal");
+    lg.Box = "off";
+
+    % ---- Row 2: Left thigh ----
+    ax21 = nexttile;
+    plot(Lr(:,1), aLr); hold on; plot(Lr(:,1), wLr);
+    ylabel("L thigh |a|, |w|");
+    addLines(timing_s, timingLabel, t0, t1);
+
+    ax22 = nexttile;
+    plot(Lf(:,1), aLf); hold on; plot(Lf(:,1), wLf);
+    addLines(timing_s, timingLabel, t0, t1);
+
+    % ---- Row 3: Right thigh ----
+    ax31 = nexttile;
+    plot(Rr(:,1), aRr); hold on; plot(Rr(:,1), wRr);
+    ylabel("R thigh |a|, |w|");
+    addLines(timing_s, timingLabel, t0, t1);
+
+    ax32 = nexttile;
+    plot(Rf(:,1), aRf); hold on; plot(Rf(:,1), wRf);
+    addLines(timing_s, timingLabel, t0, t1);
+
+    % ---- Row 4: ECG ----
+    ax41 = nexttile;
+    plot(Er(:,1), Er(:,2));
+    ylabel("ECG (V)");
+    addLines(timing_s, timingLabel, t0, t1);
+
+    ax42 = nexttile;
+    plot(Ef(:,1), Ef(:,2));
+    addLines(timing_s, timingLabel, t0, t1);
+
+    % ---- Row 5: GSS/GSR ----
+    ax51 = nexttile;
+    plot(Gr(:,1), Gr(:,2));
+    ylabel("GSS / GSR (V)");
+    xlabel("Time (s)");
+    addLines(timing_s, timingLabel, t0, t1);
+
+    ax52 = nexttile;
+    plot(Gf(:,1), Gf(:,2));
+    xlabel("Time (s)");
+    addLines(timing_s, timingLabel, t0, t1);
+
+    % Link x-axes for easy comparison/zooming
+    linkaxes([ax11 ax12 ax21 ax22 ax31 ax32 ax41 ax42 ax51 ax52], 'x');
+end
+
+function addLines(timing_s, timingLabel, t0, t1)
+    if isempty(timing_s), return; end
+    inWin = timing_s>=t0 & timing_s<=t1;
+    ts = timing_s(inWin);
+    ls = timingLabel(inWin);
+    for i = 1:numel(ts)
+        xline(ts(i), "--", "L" + ls(i), "LabelOrientation", "horizontal");
+    end
+end
