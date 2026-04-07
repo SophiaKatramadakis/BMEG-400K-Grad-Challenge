@@ -442,6 +442,11 @@ if ~isempty(dur_fall)
     hold off
 end
 
+
+
+
+
+
 %% ============================================================
 %% SECTION C - ML MODEL WITH FIXED LABEL-TO-RAW TRIAL MATCHING
 %% ============================================================
@@ -451,15 +456,18 @@ end
 % 1 = NearFall
 % 2 = Fall
 %
-% Since Section B and Section C now use the same eventStruct and the same
-% event usability checks, the near-fall counts should be consistent.
+% Consistency rule:
+% - Random Forest and SVM use the SAME extracted samples
+% - SAME participant split
+% - SAME balanced training set
+% - SAME held-out test set
 
 % ---- MANUAL PARTICIPANT SPLIT ----
 testParticipants = ["P1960","P2070","P2995"];
 allParticipants = string(fieldnames(raw_filt));
 trainParticipants = setdiff(allParticipants, testParticipants);
 
-%% C2) Build feature matrix using LABEL TRIALS as master list
+%% C1) Build feature matrix using LABEL TRIALS as master list
 X = [];
 Y = [];
 sampleParticipant = strings(0,1);
@@ -507,7 +515,7 @@ for p = 1:numel(participants)
         nearFallsFull = eventStruct.(pID).(trLabel).NearFall;
         fallsFull     = eventStruct.(pID).(trLabel).Fall;
 
-        % Keep only usable events so printed counts match Section B
+        % Keep only usable events
         nearFalls = filterUsableIntervals(nearFallsFull, t, minSamplesPerSegment);
         falls     = filterUsableIntervals(fallsFull, t, minSamplesPerSegment);
 
@@ -552,7 +560,6 @@ for p = 1:numel(participants)
         end
 
         %% ---- CLEAN ADL WINDOWS ----
-        % Make allEvents robust to empty nearFalls or falls
         allEvents = [];
 
         if ~isempty(nearFalls)
@@ -597,7 +604,8 @@ Ycat = categorical(Y, [0 1 2], {'ADL','NearFall','Fall'});
 fprintf("\nOverall class counts:\n");
 disp(countcats(Ycat))
 disp(categories(Ycat))
-%% C3) Print counts by participant
+
+%% C2) Print counts by participant
 fprintf('\nCounts by participant:\n');
 uP = unique(sampleParticipant);
 for i = 1:numel(uP)
@@ -607,7 +615,7 @@ for i = 1:numel(uP)
         sum(Yi=='ADL'), sum(Yi=='NearFall'), sum(Yi=='Fall'));
 end
 
-%% C4) Split using manual participant split
+%% C3) Split using manual participant split
 isTrain = ismember(sampleParticipant, trainParticipants);
 isTest  = ismember(sampleParticipant, testParticipants);
 
@@ -634,7 +642,7 @@ fprintf('\nTesting class counts:\n');
 disp(countcats(YTest))
 disp(categories(YTest))
 
-%% C5) Balance training data
+%% C4) Balance training data
 idxADL  = find(YTrain == 'ADL');
 idxNF   = find(YTrain == 'NearFall');
 idxFall = find(YTrain == 'Fall');
@@ -671,7 +679,7 @@ fprintf('\nBalanced training class counts:\n');
 disp(countcats(YTrain_bal))
 disp(categories(YTrain_bal))
 
-%% C6) Train Random Forest
+%% C5) Train Random Forest
 rfModel = TreeBagger(numTrees, XTrain_bal, YTrain_bal, ...
     'Method', 'classification', ...
     'OOBPrediction', 'On', ...
@@ -679,32 +687,56 @@ rfModel = TreeBagger(numTrees, XTrain_bal, YTrain_bal, ...
 
 disp("Random forest trained.");
 
-%% C7) Evaluate
-predTest = predict(rfModel, XTest);
-predTest = categorical(predTest, {'ADL','NearFall','Fall'});
+%% C6) Random Forest OOB training confusion matrix
+predTrain_rf_oob = oobPredict(rfModel);
+predTrain_rf_oob = categorical(predTrain_rf_oob, {'ADL','NearFall','Fall'});
 
-fprintf('\nPredicted class counts:\n');
-disp(countcats(predTest))
-disp(categories(predTest))
-
-acc = mean(predTest == YTest);
-fprintf("\nTest accuracy: %.3f\n", acc);
+mat_rf_oob = confusionmat(YTrain_bal, predTrain_rf_oob, ...
+    'Order', categorical({'ADL','NearFall','Fall'}));
 
 figure;
-confusionchart(YTest, predTest);
-title('Random Forest Confusion Matrix - Fixed Trial Matching');
+confusionchart(mat_rf_oob, {'ADL','NearFall','Fall'});
+title("RANDOM FOREST OOB TRAINING")
 
-cm = confusionmat(YTest, predTest, 'Order', categorical({'ADL','NearFall','Fall'}));
-disp("Confusion matrix rows=true, cols=predicted")
-disp(array2table(cm, ...
+disp("Random Forest OOB training confusion matrix rows=true, cols=predicted")
+disp(array2table(mat_rf_oob, ...
     'VariableNames', {'Pred_ADL','Pred_NearFall','Pred_Fall'}, ...
     'RowNames', {'True_ADL','True_NearFall','True_Fall'}))
 
-%% C8) Feature importance
+rfTrainAcc_oob = mean(predTrain_rf_oob == YTrain_bal);
+fprintf("\nRandom Forest OOB training accuracy: %.3f\n", rfTrainAcc_oob);
+
+%% C7) Random Forest TEST confusion matrix
+predTest_rf = predict(rfModel, XTest);
+predTest_rf = categorical(predTest_rf, {'ADL','NearFall','Fall'});
+
+fprintf('\nRandom Forest predicted test class counts:\n');
+disp(countcats(predTest_rf))
+disp(categories(predTest_rf))
+
+rfTestAcc = mean(predTest_rf == YTest);
+fprintf("\nRandom Forest test accuracy: %.3f\n", rfTestAcc);
+
+mat_rf_test = confusionmat(YTest, predTest_rf, ...
+    'Order', categorical({'ADL','NearFall','Fall'}));
+
+figure;
+confusionchart(mat_rf_test, {'ADL','NearFall','Fall'});
+title('RANDOM FOREST TEST CONFUSION MATRIX')
+
+disp("Random Forest test confusion matrix rows=true, cols=predicted")
+disp(array2table(mat_rf_test, ...
+    'VariableNames', {'Pred_ADL','Pred_NearFall','Pred_Fall'}, ...
+    'RowNames', {'True_ADL','True_NearFall','True_Fall'}))
+
+
+
+
+%% C8) Random Forest feature importance
 importance = rfModel.OOBPermutedPredictorDeltaError(:);
 [importanceSorted, idxSort] = sort(importance, 'descend');
 
-disp("Top feature importances:")
+disp("Top Random Forest feature importances:")
 topN = min(10, numel(idxSort));
 for i = 1:topN
     fprintf("%2d. %-25s %.4f\n", i, featNames{idxSort(i)}, importanceSorted(i));
@@ -716,7 +748,75 @@ xticks(1:topN);
 xticklabels(featNames(idxSort(1:topN)));
 xtickangle(45);
 ylabel('OOB Permuted Predictor Delta Error');
-title('Top Feature Importances - Fixed Trial Matching');
+title('Top Random Forest Feature Importances');
+
+%% ============================================================
+%% SECTION D - SVM USING THE EXACT SAME DATA AS RANDOM FOREST
+%% ============================================================
+
+rng(1);
+
+%% D1) Standardize using ONLY balanced training set statistics
+mu_train = mean(XTrain_bal, 1);
+sig_train = std(XTrain_bal, 0, 1);
+sig_train(sig_train == 0) = 1;
+
+XTrain_svm = (XTrain_bal - mu_train) ./ sig_train;
+XTest_svm  = (XTest      - mu_train) ./ sig_train;
+
+%% D2) Set up SVM learner
+t_svm = templateSVM( ...
+    'KernelFunction','linear', ...
+    'KernelScale','auto', ...
+    'Standardize',false);
+
+%% D3) Train SVM on SAME balanced training data as RF
+Mdl_svm = fitcecoc(XTrain_svm, YTrain_bal, ...
+    'Learners', t_svm, ...
+    'Prior', 'uniform');
+
+disp("SVM trained.");
+
+%% D4) SVM cross-validated TRAINING confusion matrix
+svmCV = crossval(Mdl_svm, "KFold", 5);
+predTrain_svm_cv = kfoldPredict(svmCV);
+
+mat_svm_cv = confusionmat(YTrain_bal, predTrain_svm_cv, ...
+    'Order', categorical({'ADL','NearFall','Fall'}));
+
+figure;
+confusionchart(mat_svm_cv, {'ADL','NearFall','Fall'});
+title("SVM CROSS VALIDATION TRAINING")
+
+disp("SVM cross-validated training confusion matrix rows=true, cols=predicted")
+disp(array2table(mat_svm_cv, ...
+    'VariableNames', {'Pred_ADL','Pred_NearFall','Pred_Fall'}, ...
+    'RowNames', {'True_ADL','True_NearFall','True_Fall'}))
+
+svmTrainAcc_cv = mean(predTrain_svm_cv == YTrain_bal);
+fprintf("\nSVM cross-validated training accuracy: %.3f\n", svmTrainAcc_cv);
+
+%% D5) SVM TEST confusion matrix using SAME XTest/YTest as RF
+predTest_svm = predict(Mdl_svm, XTest_svm);
+
+mat_svm_test = confusionmat(YTest, predTest_svm, ...
+    'Order', categorical({'ADL','NearFall','Fall'}));
+
+figure;
+confusionchart(mat_svm_test, {'ADL','NearFall','Fall'});
+title("SVM TEST CONFUSION MATRIX")
+
+disp("SVM test confusion matrix rows=true, cols=predicted")
+disp(array2table(mat_svm_test, ...
+    'VariableNames', {'Pred_ADL','Pred_NearFall','Pred_Fall'}, ...
+    'RowNames', {'True_ADL','True_NearFall','True_Fall'}))
+
+svmTestAcc = mean(predTest_svm == YTest);
+fprintf("\nSVM test accuracy: %.3f\n", svmTestAcc);
+
+fprintf("\nSVM predicted test class counts:\n");
+disp(countcats(predTest_svm))
+disp(categories(predTest_svm))
 
 %% ============================================================
 %% LOCAL FUNCTIONS
@@ -1134,4 +1234,21 @@ function featNames = getSegmentFeatureNames()
             c = c + 1;
         end
     end
+end
+
+
+
+function err = svmCVLoss(Xtr, Ytr, Xval, Yval)
+% Helper loss function for sequentialfs using ECOC SVM
+
+    t_local = templateSVM('KernelFunction','linear', ...
+                          'KernelScale','auto', ...
+                          'Standardize',false);
+
+    mdl_local = fitcecoc(Xtr, Ytr, ...
+        'Learners', t_local, ...
+        'Prior', 'uniform');
+
+    pred_local = predict(mdl_local, Xval);
+    err = mean(pred_local ~= Yval);
 end
