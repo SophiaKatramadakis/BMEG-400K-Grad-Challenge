@@ -2,14 +2,12 @@
 % This script combines:
 % 1) Filtering all sensor data
 % 2) Windowing / near-fall duration analysis
+% 3) ML model building
 %
-% Notes
-% - Update filePath to your own MAT file location
-% - Assumes MAT file contains:
-%       clean_labels
-%       one raw sensor struct with participant fields like P1960
-% - Filtered sensor data is stored in raw_filt
-% - Figures are generated for raw vs filtered comparisons and duration histograms
+% Main consistency fix
+% Section B now counts ONLY the near-fall events that are also usable by
+% Section C. This makes the near-fall counts in the windowing section
+% consistent with the counts used for ML.
 
 clear; clc;
 
@@ -68,17 +66,14 @@ end
 %% ============================================================
 
 %% Filter parameters
-% IMU
 IMU.lowpass_fc = 20;      % Hz
 
-% ECG
 ECG.bandpass_f1 = 0.5;    % Hz
 ECG.bandpass_f2 = 150;    % Hz
 ECG.use_notch   = true;
 ECG.notch_f1    = 50;     % Hz
 ECG.notch_f2    = 70;     % Hz
 
-% GSS / GSR
 GSR.lowpass_fc = 1;       % Hz
 
 %% Apply filters to ALL data
@@ -94,28 +89,23 @@ for p = 1:numel(participants_raw)
         tr = trialNames(tt);
         X = raw.(pID).(tr);
 
-        % Back IMU
         if isfield(X,"Back")
             raw_filt.(pID).(tr).Back = filterIMU_Matrix(X.Back, IMU.lowpass_fc);
         end
 
-        % Left thigh IMU
         if isfield(X,"Left_Thigh")
             raw_filt.(pID).(tr).Left_Thigh = filterIMU_Matrix(X.Left_Thigh, IMU.lowpass_fc);
         end
 
-        % Right thigh IMU
         if isfield(X,"Right_Thigh")
             raw_filt.(pID).(tr).Right_Thigh = filterIMU_Matrix(X.Right_Thigh, IMU.lowpass_fc);
         end
 
-        % ECG
         if isfield(X,"ECG")
             raw_filt.(pID).(tr).ECG = filterECG_Matrix(X.ECG, ECG.bandpass_f1, ECG.bandpass_f2, ...
                 ECG.use_notch, ECG.notch_f1, ECG.notch_f2);
         end
 
-        % GSS
         if isfield(X,"GSS")
             raw_filt.(pID).(tr).GSS = filterGSR_Matrix(X.GSS, GSR.lowpass_fc);
         end
@@ -134,13 +124,11 @@ standTrial   = "Stand";
 for pID = participantsToPlot
     fprintf("\n=== Plotting participant %s (RAW vs FILTERED) ===\n", pID);
 
-    % Slip near-fall and fall windows from labels
     if ~isfield(labels, pID) || ~isfield(labels.(pID), perturbTrial)
         warning("No labels found for %s %s. Skipping perturb plots.", pID, perturbTrial);
     else
         T = labels.(pID).(perturbTrial);
 
-        % Near-fall block
         nf_rows = find(T(:,3)==1);
         if numel(nf_rows) >= 3
             nf_block = T(nf_rows(1:3),:);
@@ -153,7 +141,6 @@ for pID = participantsToPlot
             warning("No near-fall block (group 1) found in %s %s.", pID, perturbTrial);
         end
 
-        % Fall block
         fall_rows = find(T(:,3)==4);
         if numel(fall_rows) >= 4
             fall_block = T(fall_rows(1:4),:);
@@ -167,13 +154,11 @@ for pID = participantsToPlot
         end
     end
 
-    % Walk first 20 s
     if isfield(raw, pID)
         plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, adlTrial, ...
             0, 20, false, "ADL window (Walk) first 20s RAW vs FILTERED");
     end
 
-    % Stand first 60 s
     if isfield(raw, pID)
         plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, standTrial, ...
             0, 60, false, "ADL window (Stand) first 60s RAW vs FILTERED");
@@ -181,73 +166,97 @@ for pID = participantsToPlot
 end
 
 %% ============================================================
+%% SHARED SETTINGS FOR SECTION B AND C
+%% ============================================================
+
+rng(1);
+
+adlWindow_s = 1.0;
+adlStep_s   = 1.0;
+eventBuffer_s = 0.25;
+numTrees = 200;
+minSamplesPerSegment = 20;
+
+%% ============================================================
+%% BUILD SHARED EVENT STRUCT
+%% ============================================================
+% This is the same event definition used by BOTH Section B and Section C.
+
+eventStruct = buildEventStruct(labels);
+disp("Event intervals built.");
+
+%% ============================================================
 %% SECTION B - WINDOWING / NEAR-FALL DURATION ANALYSIS
 %% ============================================================
+% Consistency fix
+% Only count near-falls that Section C could also use:
+% 1) matching raw trial exists
+% 2) Back sensor exists
+% 3) enough samples in the event segment
 
 participants_labels = fieldnames(labels);
 
 durations = [];
 isFallAfter = [];
+durParticipant = strings(0,1);
+durTrial = strings(0,1);
 
 for p = 1:numel(participants_labels)
 
     pID = participants_labels{p};
-    trials = fieldnames(labels.(pID));
 
-    for t = 1:numel(trials)
+    if ~isfield(raw_filt, pID)
+        continue
+    end
 
-        trialName = trials{t};
-        T = labels.(pID).(trialName);
+    labelTrials = fieldnames(labels.(pID));
 
-        if isempty(T) || size(T,2) < 3
+    for t = 1:numel(labelTrials)
+
+        trLabel = labelTrials{t};
+
+        rawTrialField = resolveRawTrialField(raw_filt.(pID), trLabel);
+        if strlength(rawTrialField) == 0
             continue
         end
 
-        eventLabel = T(:,1);
-        time_s = T(:,2)/1000;
-
-        % Near-fall start rows
-        nf_start_rows = find(eventLabel == 2);
-
-        if isempty(nf_start_rows)
+        if ~isfield(raw_filt.(pID).(rawTrialField), 'Back')
             continue
         end
 
-        for i = 1:numel(nf_start_rows)
+        M = raw_filt.(pID).(rawTrialField).Back;
+        if size(M,1) < minSamplesPerSegment
+            continue
+        end
 
-            r_start = nf_start_rows(i);
-            t_start = time_s(r_start);
+        timeRaw = M(:,1);
+        nearFalls = eventStruct.(pID).(trLabel).NearFall;
 
-            % Rows after near-fall start
-            future_rows = find(time_s > t_start);
-            if isempty(future_rows)
+        for i = 1:size(nearFalls,1)
+            t0 = nearFalls(i,1);
+            t1 = nearFalls(i,2);
+            termLbl = nearFalls(i,3);
+
+            idx = timeRaw >= t0 & timeRaw <= t1;
+            if sum(idx) < minSamplesPerSegment
                 continue
             end
 
-            future_labels = eventLabel(future_rows);
-
-            % First recovery or fall after near-fall start
-            term_idx = find(future_labels == 3 | future_labels == 4, 1, 'first');
-            if isempty(term_idx)
-                continue
-            end
-
-            r_end   = future_rows(term_idx);
-            t_end   = time_s(r_end);
-            termLbl = eventLabel(r_end);
-
-            dur = t_end - t_start;
-            fellAfter = (termLbl == 4);
-
-            durations(end+1,1)   = dur;
-            isFallAfter(end+1,1) = fellAfter;
+            durations(end+1,1) = t1 - t0;
+            isFallAfter(end+1,1) = (termLbl == 4);
+            durParticipant(end+1,1) = string(pID);
+            durTrial(end+1,1) = string(trLabel);
         end
     end
 end
 
 %% 1) Total number of near-fall periods
 nTotal = numel(durations);
-fprintf("\nTotal near-fall periods across all participants and trials: %d\n", nTotal);
+fprintf("\nTotal usable near-fall periods across all participants and trials: %d\n", nTotal);
+
+if isempty(durations)
+    error("No usable near-fall events found after raw trial matching and minSamplesPerSegment filtering.");
+end
 
 %% 2) Average and standard deviation
 meanDur = mean(durations);
@@ -272,14 +281,28 @@ fprintf("MATLAB iqr check: %.3f s\n", IQR_matlab);
 dur_fall = durations(isFallAfter == 1);
 dur_rec  = durations(isFallAfter == 0);
 
-mean_fall = mean(dur_fall);
-mean_rec  = mean(dur_rec);
+if ~isempty(dur_fall)
+    mean_fall = mean(dur_fall);
+else
+    mean_fall = NaN;
+end
+
+if ~isempty(dur_rec)
+    mean_rec = mean(dur_rec);
+else
+    mean_rec = NaN;
+end
 
 fprintf("\nMean duration (Near-Fall BEFORE Fall): %.3f s\n", mean_fall);
 fprintf("Mean duration (Recovered Near-Fall): %.3f s\n", mean_rec);
 
-[~, pValue] = ttest2(dur_fall, dur_rec);
-fprintf("Two-sample t-test p-value: %.5f\n", pValue);
+if ~isempty(dur_fall) && ~isempty(dur_rec) && numel(dur_fall) > 1 && numel(dur_rec) > 1
+    [~, pValue] = ttest2(dur_fall, dur_rec);
+    fprintf("Two-sample t-test p-value: %.5f\n", pValue);
+else
+    pValue = NaN;
+    fprintf("Two-sample t-test p-value: NaN (not enough samples in one or both groups)\n");
+end
 
 %% 5) Participant results table
 pList = strings(0,1);
@@ -289,47 +312,49 @@ fallCounts = [];
 for p = 1:numel(participants_labels)
 
     pID = participants_labels{p};
-    trials = fieldnames(labels.(pID));
+
+    if ~isfield(raw_filt, pID)
+        continue
+    end
+
+    labelTrials = fieldnames(labels.(pID));
     nRec_p = 0;
     nFall_p = 0;
 
-    for t = 1:numel(trials)
+    for t = 1:numel(labelTrials)
 
-        trialName = trials{t};
-        T = labels.(pID).(trialName);
+        trLabel = labelTrials{t};
 
-        if isempty(T) || size(T,2) < 3
+        rawTrialField = resolveRawTrialField(raw_filt.(pID), trLabel);
+        if strlength(rawTrialField) == 0
             continue
         end
 
-        eventLabel = T(:,1);
-        time_s = T(:,2)/1000;
-
-        nf_start_rows = find(eventLabel == 2);
-        if isempty(nf_start_rows)
+        if ~isfield(raw_filt.(pID).(rawTrialField), 'Back')
             continue
         end
 
-        for i = 1:numel(nf_start_rows)
-            r_start = nf_start_rows(i);
-            t_start = time_s(r_start);
+        M = raw_filt.(pID).(rawTrialField).Back;
+        if size(M,1) < minSamplesPerSegment
+            continue
+        end
 
-            future_rows = find(time_s > t_start);
-            if isempty(future_rows)
+        timeRaw = M(:,1);
+        nearFalls = eventStruct.(pID).(trLabel).NearFall;
+
+        for i = 1:size(nearFalls,1)
+            t0 = nearFalls(i,1);
+            t1 = nearFalls(i,2);
+            termLbl = nearFalls(i,3);
+
+            idx = timeRaw >= t0 & timeRaw <= t1;
+            if sum(idx) < minSamplesPerSegment
                 continue
             end
-
-            future_labels = eventLabel(future_rows);
-            term_idx = find(future_labels == 3 | future_labels == 4, 1, 'first');
-            if isempty(term_idx)
-                continue
-            end
-
-            termLbl = future_labels(term_idx);
 
             if termLbl == 4
                 nFall_p = nFall_p + 1;
-            else
+            elseif termLbl == 3
                 nRec_p = nRec_p + 1;
             end
         end
@@ -368,56 +393,54 @@ xline(Q1_all,'k--','LineWidth',1,'DisplayName','Q1')
 xline(Q3_all,'k--','LineWidth',1,'DisplayName','Q3')
 xlabel('Near-fall Duration (s)')
 ylabel('Number of Events')
-title('Distribution of Near-Fall Durations')
+title('Distribution of Usable Near-Fall Durations')
 legend('Near-fall durations','Mean','Median','Q1','Q3')
 grid on
 hold off
 
 %% 7) Histogram - recovered near-falls
-mean_rec = mean(dur_rec);
-median_rec = median(dur_rec);
-Q1_rec = prctile(dur_rec,25);
-Q3_rec = prctile(dur_rec,75);
+if ~isempty(dur_rec)
+    mean_rec = mean(dur_rec);
+    median_rec = median(dur_rec);
+    Q1_rec = prctile(dur_rec,25);
+    Q3_rec = prctile(dur_rec,75);
 
-figure
-histogram(dur_rec,20,'FaceColor',[0.4 0.4 0.4],'EdgeColor','none')
-hold on
-xline(mean_rec,'r','LineWidth',2,'DisplayName','Mean')
-xline(median_rec,'b','LineWidth',2,'DisplayName','Median')
-xline(Q1_rec,'k--','LineWidth',2,'DisplayName','Q1')
-xline(Q3_rec,'k--','LineWidth',2,'DisplayName','Q3')
-xlabel('Near-fall Duration (s)')
-ylabel('Number of Events')
-title('Distribution of Near-fall Durations (Recovery)')
-legend('Near-fall durations','Mean','Median','Q1','Q3','Location','best')
-grid on
-hold off
+    figure
+    histogram(dur_rec,20,'FaceColor',[0.4 0.4 0.4],'EdgeColor','none')
+    hold on
+    xline(mean_rec,'r','LineWidth',2,'DisplayName','Mean')
+    xline(median_rec,'b','LineWidth',2,'DisplayName','Median')
+    xline(Q1_rec,'k--','LineWidth',2,'DisplayName','Q1')
+    xline(Q3_rec,'k--','LineWidth',2,'DisplayName','Q3')
+    xlabel('Near-fall Duration (s)')
+    ylabel('Number of Events')
+    title('Distribution of Usable Near-fall Durations (Recovery)')
+    legend('Near-fall durations','Mean','Median','Q1','Q3','Location','best')
+    grid on
+    hold off
+end
 
 %% 8) Histogram - near-falls that transition to fall
-mean_fall = mean(dur_fall);
-median_fall = median(dur_fall);
-Q1_fall = prctile(dur_fall,25);
-Q3_fall = prctile(dur_fall,75);
+if ~isempty(dur_fall)
+    mean_fall = mean(dur_fall);
+    median_fall = median(dur_fall);
+    Q1_fall = prctile(dur_fall,25);
+    Q3_fall = prctile(dur_fall,75);
 
-figure
-histogram(dur_fall,20,'FaceColor',[0.4 0.4 0.4],'EdgeColor','none')
-hold on
-xline(mean_fall,'r','LineWidth',2,'DisplayName','Mean')
-xline(median_fall,'b','LineWidth',2,'DisplayName','Median')
-xline(Q1_fall,'k--','LineWidth',2,'DisplayName','Q1')
-xline(Q3_fall,'k--','LineWidth',2,'DisplayName','Q3')
-xlabel('Near-fall Duration (s)')
-ylabel('Number of Events')
-title('Distribution of Near-fall Durations (Transition to Fall)')
-legend('Near-fall durations','Mean','Median','Q1','Q3','Location','best')
-grid on
-hold off
-
-
-
-
-
-
+    figure
+    histogram(dur_fall,20,'FaceColor',[0.4 0.4 0.4],'EdgeColor','none')
+    hold on
+    xline(mean_fall,'r','LineWidth',2,'DisplayName','Mean')
+    xline(median_fall,'b','LineWidth',2,'DisplayName','Median')
+    xline(Q1_fall,'k--','LineWidth',2,'DisplayName','Q1')
+    xline(Q3_fall,'k--','LineWidth',2,'DisplayName','Q3')
+    xlabel('Near-fall Duration (s)')
+    ylabel('Number of Events')
+    title('Distribution of Usable Near-fall Durations (Transition to Fall)')
+    legend('Near-fall durations','Mean','Median','Q1','Q3','Location','best')
+    grid on
+    hold off
+end
 
 %% ============================================================
 %% SECTION C - ML MODEL WITH FIXED LABEL-TO-RAW TRIAL MATCHING
@@ -428,99 +451,13 @@ hold off
 % 1 = NearFall
 % 2 = Fall
 %
-% Key change:
-% We loop over LABEL trials first, then find the matching raw trial field.
-% This avoids losing NearFall/Fall samples due to trial-name mismatch.
-
-rng(1);
-
-% ---- USER SETTINGS FOR ML ----
-adlWindow_s = 1.0;
-adlStep_s   = 1.0;
-eventBuffer_s = 0.25;
-numTrees = 200;
-minSamplesPerSegment = 20;
+% Since Section B and Section C now use the same eventStruct and the same
+% event usability checks, the near-fall counts should be consistent.
 
 % ---- MANUAL PARTICIPANT SPLIT ----
-% You can change these after checking the printed participant counts
 testParticipants = ["P1960","P2070","P2995"];
 allParticipants = string(fieldnames(raw_filt));
 trainParticipants = setdiff(allParticipants, testParticipants);
-
-%% C1) Build event intervals from labels
-eventStruct = struct();
-participants_labels = fieldnames(labels);
-
-for p = 1:numel(participants_labels)
-
-    pID = participants_labels{p};
-    labelTrials = fieldnames(labels.(pID));
-
-    for tt = 1:numel(labelTrials)
-
-        trLabel = labelTrials{tt};
-        T = labels.(pID).(trLabel);
-
-        nearFalls = [];
-        falls = [];
-
-        if isempty(T) || size(T,2) < 2
-            eventStruct.(pID).(trLabel).NearFall = nearFalls;
-            eventStruct.(pID).(trLabel).Fall = falls;
-            continue
-        end
-
-        eventLabel = T(:,1);
-        time_s = T(:,2)/1000;
-
-        % Near-fall = label 2 to first subsequent 3 or 4
-        nfStartRows = find(eventLabel == 2);
-        for i = 1:numel(nfStartRows)
-            r0 = nfStartRows(i);
-            t0 = time_s(r0);
-
-            futureRows = find(time_s > t0);
-            if isempty(futureRows), continue; end
-
-            futureLabels = eventLabel(futureRows);
-            idxEnd = find(futureLabels == 3 | futureLabels == 4, 1, 'first');
-            if isempty(idxEnd), continue; end
-
-            r1 = futureRows(idxEnd);
-            t1 = time_s(r1);
-
-            if t1 > t0
-                nearFalls(end+1,:) = [t0 t1];
-            end
-        end
-
-        % Fall = label 4 to first subsequent 5
-        fallRows = find(eventLabel == 4);
-        for i = 1:numel(fallRows)
-            r0 = fallRows(i);
-            t0 = time_s(r0);
-
-            futureRows = find(time_s > t0);
-            if isempty(futureRows), continue; end
-
-            futureLabels = eventLabel(futureRows);
-            idxEnd = find(futureLabels == 5, 1, 'first');
-            if isempty(idxEnd), continue; end
-
-            r1 = futureRows(idxEnd);
-            t1 = time_s(r1);
-
-            if t1 > t0
-                falls(end+1,:) = [t0 t1];
-            end
-        end
-
-        eventStruct.(pID).(trLabel).NearFall = nearFalls;
-        eventStruct.(pID).(trLabel).Fall = falls;
-    end
-end
-
-disp("Event intervals built for ML.");
 
 %% C2) Build feature matrix using LABEL TRIALS as master list
 X = [];
@@ -546,7 +483,6 @@ for p = 1:numel(participants)
 
         trLabel = labelTrials{tt};
 
-        % Find matching raw trial field
         rawTrialField = resolveRawTrialField(raw_filt.(pID), trLabel);
 
         if strlength(rawTrialField) == 0
@@ -568,8 +504,12 @@ for p = 1:numel(participants)
             continue;
         end
 
-        nearFalls = eventStruct.(pID).(trLabel).NearFall;
-        falls     = eventStruct.(pID).(trLabel).Fall;
+        nearFallsFull = eventStruct.(pID).(trLabel).NearFall;
+        fallsFull     = eventStruct.(pID).(trLabel).Fall;
+
+        % Keep only usable events so printed counts match Section B
+        nearFalls = filterUsableIntervals(nearFallsFull, t, minSamplesPerSegment);
+        falls     = filterUsableIntervals(fallsFull, t, minSamplesPerSegment);
 
         fprintf("  %s -> %s | NF=%d Fall=%d\n", trLabel, rawTrialField, size(nearFalls,1), size(falls,1));
 
@@ -612,7 +552,16 @@ for p = 1:numel(participants)
         end
 
         %% ---- CLEAN ADL WINDOWS ----
-        allEvents = [nearFalls; falls];
+        % Make allEvents robust to empty nearFalls or falls
+        allEvents = [];
+
+        if ~isempty(nearFalls)
+            allEvents = [allEvents; nearFalls(:,1:2)];
+        end
+
+        if ~isempty(falls)
+            allEvents = [allEvents; falls(:,1:2)];
+        end
 
         tStartAll = t(1);
         tEndAll   = t(end);
@@ -648,7 +597,6 @@ Ycat = categorical(Y, [0 1 2], {'ADL','NearFall','Fall'});
 fprintf("\nOverall class counts:\n");
 disp(countcats(Ycat))
 disp(categories(Ycat))
-
 %% C3) Print counts by participant
 fprintf('\nCounts by participant:\n');
 uP = unique(sampleParticipant);
@@ -770,11 +718,122 @@ xtickangle(45);
 ylabel('OOB Permuted Predictor Delta Error');
 title('Top Feature Importances - Fixed Trial Matching');
 
-
-
 %% ============================================================
 %% LOCAL FUNCTIONS
 %% ============================================================
+
+function eventStruct = buildEventStruct(labels)
+% Builds a shared eventStruct used by both Section B and Section C
+%
+% NearFall rows stored as [t0 t1 termLabel]
+% where termLabel is 3 for recovered or 4 for fell
+%
+% Fall rows stored as [t0 t1]
+
+    eventStruct = struct();
+    participants_labels = fieldnames(labels);
+
+    for p = 1:numel(participants_labels)
+
+        pID = participants_labels{p};
+        labelTrials = fieldnames(labels.(pID));
+
+        for tt = 1:numel(labelTrials)
+
+            trLabel = labelTrials{tt};
+            T = labels.(pID).(trLabel);
+
+            nearFalls = [];
+            falls = [];
+
+            if isempty(T) || size(T,2) < 2
+                eventStruct.(pID).(trLabel).NearFall = nearFalls;
+                eventStruct.(pID).(trLabel).Fall = falls;
+                continue
+            end
+
+            eventLabel = T(:,1);
+            time_s = T(:,2)/1000;
+
+            % Near-fall = label 2 to first subsequent 3 or 4
+            nfStartRows = find(eventLabel == 2);
+            for i = 1:numel(nfStartRows)
+                r0 = nfStartRows(i);
+                t0 = time_s(r0);
+
+                futureRows = find(time_s > t0);
+                if isempty(futureRows)
+                    continue
+                end
+
+                futureLabels = eventLabel(futureRows);
+                idxEnd = find(futureLabels == 3 | futureLabels == 4, 1, 'first');
+                if isempty(idxEnd)
+                    continue
+                end
+
+                r1 = futureRows(idxEnd);
+                t1 = time_s(r1);
+                termLbl = eventLabel(r1);
+
+                if t1 > t0
+                    nearFalls(end+1,:) = [t0 t1 termLbl];
+                end
+            end
+
+            % Fall = label 4 to first subsequent 5
+            fallRows = find(eventLabel == 4);
+            for i = 1:numel(fallRows)
+                r0 = fallRows(i);
+                t0 = time_s(r0);
+
+                futureRows = find(time_s > t0);
+                if isempty(futureRows)
+                    continue
+                end
+
+                futureLabels = eventLabel(futureRows);
+                idxEnd = find(futureLabels == 5, 1, 'first');
+                if isempty(idxEnd)
+                    continue
+                end
+
+                r1 = futureRows(idxEnd);
+                t1 = time_s(r1);
+
+                if t1 > t0
+                    falls(end+1,:) = [t0 t1];
+                end
+            end
+
+            eventStruct.(pID).(trLabel).NearFall = nearFalls;
+            eventStruct.(pID).(trLabel).Fall = falls;
+        end
+    end
+end
+
+function intervalsOut = filterUsableIntervals(intervalsIn, t, minSamplesPerSegment)
+% Keeps only intervals that have enough samples in the raw signal
+% Preserves the number of columns even when empty
+
+    if isempty(intervalsIn)
+        intervalsOut = intervalsIn;
+        return
+    end
+
+    intervalsOut = zeros(0, size(intervalsIn,2));
+
+    for i = 1:size(intervalsIn,1)
+        t0 = intervalsIn(i,1);
+        t1 = intervalsIn(i,2);
+
+        idx = t >= t0 & t <= t1;
+        if sum(idx) >= minSamplesPerSegment
+            intervalsOut(end+1,:) = intervalsIn(i,:);
+        end
+    end
+end
+
 
 function M_f = filterIMU_Matrix(M, fc_lowpass)
 % M is Nx7: [t, ax, ay, az, wx, wy, wz]
@@ -982,10 +1041,7 @@ function addLines(timing_s, timingLabel, t0, t1)
     for i = 1:numel(ts)
         xline(ts(i), "--", "L" + ls(i), "LabelOrientation", "horizontal");
     end
-    
 end
-
-
 
 function rawTrialField = resolveRawTrialField(rawParticipantStruct, labelTrialName)
 % Find matching raw trial field for a label trial name
@@ -994,17 +1050,15 @@ function rawTrialField = resolveRawTrialField(rawParticipantStruct, labelTrialNa
 
     rawFields = string(fieldnames(rawParticipantStruct));
 
-    % Exact match first
     if any(rawFields == labelTrialName)
         rawTrialField = labelTrialName;
         return;
     end
 
-    % Partial match next
     hits = rawFields(contains(rawFields, labelTrialName, 'IgnoreCase', true));
 
     if ~isempty(hits)
-        rawTrialField = hits(end);   % choose last match
+        rawTrialField = hits(end);
         return;
     end
 end
