@@ -2,12 +2,7 @@
 % This script combines:
 % 1) Filtering all sensor data
 % 2) Windowing / near-fall duration analysis
-% 3) ML model building
-%
-% Main consistency fix
-% Section B now counts ONLY the near-fall events that are also usable by
-% Section C. This makes the near-fall counts in the windowing section
-% consistent with the counts used for ML.
+% 3) ML model building (Random Forest and SMV Cross Validation)
 
 clear; clc;
 
