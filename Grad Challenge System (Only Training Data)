@@ -1,66 +1,85 @@
-%% ===== Grand Challenge Signal Processing Combined Script =====
-% This script combines:
-% 1) Filtering all sensor data
-% 2) Windowing / near-fall duration analysis
-% 3) ML model building (Random Forest and SMV Cross Validation)
+% ===== Grand Challenge Full Training + Test Prediction Script =====
+% Training data:
+%   GrandChallengeData.mat
+%
+% Test data:
+%   GrandChallengeTestData.mat
+%
+% Outputs:
+%   - Random Forest OOB training confusion matrix
+%   - SVM cross-validated training confusion matrix
+%   - RF and SVM predictions for the unlabeled test data
+%   - RF and SVM submission tables per participant / trial
+%
+% Notes:
+%   - Back is used as the main torso sensor when available
+%   - Sternum is used when Back is not available
+%   - Left_Thigh/Right_Thigh are preferred for limb sensors
+%   - Left_Arm/Right_Arm are used if thigh sensors are not available
+%   - ECG and GSS are also included in the feature vector
 
-clear; clc;
-
-%% 1) Load MAT file
-filePath = "/Users/sophiakatramadakis/Documents/MATLAB/GrandChallengeData.mat"; % <-- update if needed
-S = load(filePath);
-
-disp("Top-level variables in MAT file:");
-disp(fieldnames(S))
-
-%% 2) Assign labels
-if ~isfield(S, "clean_labels")
-    error("Expected S.clean_labels but it wasn't found. Check fieldnames(S).");
-end
-labels = S.clean_labels;
-
-%% 3) Auto-find raw sensor struct
-names = fieldnames(S);
-raw = [];
-
-for k = 1:numel(names)
-    nm = names{k};
-
-    if strcmp(nm, "clean_labels")
-        continue;
-    end
-    if ~isstruct(S.(nm))
-        continue;
-    end
-    if ~isfield(S.(nm), "P1960")
-        continue;
-    end
-
-    trialFields = fieldnames(S.(nm).P1960);
-    if isempty(trialFields)
-        continue;
-    end
-
-    t1 = trialFields{1};
-    if isstruct(S.(nm).P1960.(t1))
-        sf = fieldnames(S.(nm).P1960.(t1));
-        if any(strcmp(sf,"Back")) && any(strcmp(sf,"ECG")) && any(strcmp(sf,"GSS"))
-            raw = S.(nm);
-            fprintf("Using RAW sensor struct: S.%s\n", nm);
-            break
-        end
-    end
-end
-
-if isempty(raw)
-    error("Could not auto-find the raw sensor struct. Paste fieldnames(S) and I’ll point to it.");
-end
+clear; clc; close all;
 
 %% ============================================================
-%% SECTION A - FILTERING
+%% 1) USER PATHS
 %% ============================================================
 
-%% Filter parameters
+trainFilePath = "/Users/sophiakatramadakis/Documents/MATLAB/GrandChallengeData.mat";    % <-- update if needed
+testFilePath  = "/Applications/MATLAB/GrandChallengeTestData.mat";                      % <-- update if needed
+
+%% ============================================================
+%% 2) LOAD TRAINING DATA
+%% ============================================================
+
+if ~isfile(trainFilePath)
+    error("Could not find GrandChallengeData.mat at: %s", trainFilePath);
+end
+
+S_train = load(trainFilePath);
+
+disp("Top-level variables in TRAINING MAT file:");
+disp(fieldnames(S_train))
+
+if ~isfield(S_train, "clean_labels")
+    error("Expected S_train.clean_labels but it was not found.");
+end
+labels_train = S_train.clean_labels;
+
+%% ============================================================
+%% 3) LOAD TEST DATA
+%% ============================================================
+
+if ~isfile(testFilePath)
+    error("Could not find GrandChallengeTestData.mat at: %s", testFilePath);
+end
+
+S_test = load(testFilePath);
+
+disp("Top-level variables in TEST MAT file:");
+disp(fieldnames(S_test))
+
+if ~isfield(S_test, "test_data")
+    error("Expected GrandChallengeTestData.mat to contain a variable named test_data.");
+end
+
+test_data = S_test.test_data;
+
+disp("Test participants:");
+disp(fieldnames(test_data))
+
+%% ============================================================
+%% 4) AUTO-FIND RAW TRAINING SENSOR STRUCT
+%% ============================================================
+
+raw_train = autoFindRawSensorStruct(S_train, labels_train);
+
+disp("Training participants found:");
+disp(fieldnames(raw_train))
+
+%% ============================================================
+%% 5) FILTER SETTINGS
+%% ============================================================
+
 IMU.lowpass_fc = 20;      % Hz
 
 ECG.bandpass_f1 = 0.5;    % Hz
@@ -71,99 +90,6 @@ ECG.notch_f2    = 70;     % Hz
 
 GSR.lowpass_fc = 1;       % Hz
 
-%% Apply filters to ALL data
-raw_filt = raw;
-
-participants_raw = string(fieldnames(raw));
-
-for p = 1:numel(participants_raw)
-    pID = participants_raw(p);
-    trialNames = string(fieldnames(raw.(pID)));
-
-    for tt = 1:numel(trialNames)
-        tr = trialNames(tt);
-        X = raw.(pID).(tr);
-
-        if isfield(X,"Back")
-            raw_filt.(pID).(tr).Back = filterIMU_Matrix(X.Back, IMU.lowpass_fc);
-        end
-
-        if isfield(X,"Left_Thigh")
-            raw_filt.(pID).(tr).Left_Thigh = filterIMU_Matrix(X.Left_Thigh, IMU.lowpass_fc);
-        end
-
-        if isfield(X,"Right_Thigh")
-            raw_filt.(pID).(tr).Right_Thigh = filterIMU_Matrix(X.Right_Thigh, IMU.lowpass_fc);
-        end
-
-        if isfield(X,"ECG")
-            raw_filt.(pID).(tr).ECG = filterECG_Matrix(X.ECG, ECG.bandpass_f1, ECG.bandpass_f2, ...
-                ECG.use_notch, ECG.notch_f1, ECG.notch_f2);
-        end
-
-        if isfield(X,"GSS")
-            raw_filt.(pID).(tr).GSS = filterGSR_Matrix(X.GSS, GSR.lowpass_fc);
-        end
-    end
-end
-
-disp("Filtering complete: raw_filt created (same structure as raw).");
-
-%% Plot RAW vs FILTERED for selected participants and trials
-participantsToPlot = ["P1960","P2070","P2995"];
-
-perturbTrial = "Slip";
-adlTrial     = "Walk";
-standTrial   = "Stand";
-
-for pID = participantsToPlot
-    fprintf("\n=== Plotting participant %s (RAW vs FILTERED) ===\n", pID);
-
-    if ~isfield(labels, pID) || ~isfield(labels.(pID), perturbTrial)
-        warning("No labels found for %s %s. Skipping perturb plots.", pID, perturbTrial);
-    else
-        T = labels.(pID).(perturbTrial);
-
-        nf_rows = find(T(:,3)==1);
-        if numel(nf_rows) >= 3
-            nf_block = T(nf_rows(1:3),:);
-            t_nf0 = nf_block(1,2)/1000;
-            t_nf1 = nf_block(3,2)/1000 + 2;
-
-            plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, perturbTrial, ...
-                t_nf0, t_nf1, true, "NEAR-FALL window (Slip) RAW vs FILTERED");
-        else
-            warning("No near-fall block (group 1) found in %s %s.", pID, perturbTrial);
-        end
-
-        fall_rows = find(T(:,3)==4);
-        if numel(fall_rows) >= 4
-            fall_block = T(fall_rows(1:4),:);
-            t_f0 = fall_block(1,2)/1000;
-            t_f1 = fall_block(4,2)/1000 + 2;
-
-            plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, perturbTrial, ...
-                t_f0, t_f1, true, "FALL window (Slip) RAW vs FILTERED");
-        else
-            warning("No fall block (group 4) found in %s %s.", pID, perturbTrial);
-        end
-    end
-
-    if isfield(raw, pID)
-        plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, adlTrial, ...
-            0, 20, false, "ADL window (Walk) first 20s RAW vs FILTERED");
-    end
-
-    if isfield(raw, pID)
-        plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, standTrial, ...
-            0, 60, false, "ADL window (Stand) first 60s RAW vs FILTERED");
-    end
-end
-
-%% ============================================================
-%% SHARED SETTINGS FOR SECTION B AND C
-%% ============================================================
-
 rng(1);
 
 adlWindow_s = 1.0;
@@ -171,476 +97,125 @@ adlStep_s   = 1.0;
 eventBuffer_s = 0.25;
 numTrees = 200;
 minSamplesPerSegment = 20;
+kfolds = 5;
 
 %% ============================================================
-%% BUILD SHARED EVENT STRUCT
+%% SECTION A - FILTER TRAINING DATA
 %% ============================================================
-% This is the same event definition used by BOTH Section B and Section C.
 
-eventStruct = buildEventStruct(labels);
-disp("Event intervals built.");
+raw_train_filt = raw_train;
+participants_train = string(fieldnames(raw_train));
 
-%% ============================================================
-%% SECTION B - WINDOWING / NEAR-FALL DURATION ANALYSIS
-%% ============================================================
-% Consistency fix
-% Only count near-falls that Section C could also use:
-% 1) matching raw trial exists
-% 2) Back sensor exists
-% 3) enough samples in the event segment
+for p = 1:numel(participants_train)
+    pID = participants_train(p);
+    trialNames = string(fieldnames(raw_train.(pID)));
 
-participants_labels = fieldnames(labels);
+    for tt = 1:numel(trialNames)
+        tr = trialNames(tt);
+        X = raw_train.(pID).(tr);
 
-durations = [];
-isFallAfter = [];
-durParticipant = strings(0,1);
-durTrial = strings(0,1);
-
-for p = 1:numel(participants_labels)
-
-    pID = participants_labels{p};
-
-    if ~isfield(raw_filt, pID)
-        continue
-    end
-
-    labelTrials = fieldnames(labels.(pID));
-
-    for t = 1:numel(labelTrials)
-
-        trLabel = labelTrials{t};
-
-        rawTrialField = resolveRawTrialField(raw_filt.(pID), trLabel);
-        if strlength(rawTrialField) == 0
-            continue
+        if isfield(X,"Back")
+            raw_train_filt.(pID).(tr).Back = filterIMU_Matrix(X.Back, IMU.lowpass_fc);
         end
 
-        if ~isfield(raw_filt.(pID).(rawTrialField), 'Back')
-            continue
+        if isfield(X,"Left_Thigh")
+            raw_train_filt.(pID).(tr).Left_Thigh = filterIMU_Matrix(X.Left_Thigh, IMU.lowpass_fc);
         end
 
-        M = raw_filt.(pID).(rawTrialField).Back;
-        if size(M,1) < minSamplesPerSegment
-            continue
+        if isfield(X,"Right_Thigh")
+            raw_train_filt.(pID).(tr).Right_Thigh = filterIMU_Matrix(X.Right_Thigh, IMU.lowpass_fc);
         end
 
-        timeRaw = M(:,1);
-        nearFalls = eventStruct.(pID).(trLabel).NearFall;
+        if isfield(X,"ECG")
+            raw_train_filt.(pID).(tr).ECG = filterECG_Matrix(X.ECG, ECG.bandpass_f1, ECG.bandpass_f2, ...
+                ECG.use_notch, ECG.notch_f1, ECG.notch_f2);
+        end
 
-        for i = 1:size(nearFalls,1)
-            t0 = nearFalls(i,1);
-            t1 = nearFalls(i,2);
-            termLbl = nearFalls(i,3);
-
-            idx = timeRaw >= t0 & timeRaw <= t1;
-            if sum(idx) < minSamplesPerSegment
-                continue
-            end
-
-            durations(end+1,1) = t1 - t0;
-            isFallAfter(end+1,1) = (termLbl == 4);
-            durParticipant(end+1,1) = string(pID);
-            durTrial(end+1,1) = string(trLabel);
+        if isfield(X,"GSS")
+            raw_train_filt.(pID).(tr).GSS = filterGSR_Matrix(X.GSS, GSR.lowpass_fc);
         end
     end
 end
 
-%% 1) Total number of near-fall periods
-nTotal = numel(durations);
-fprintf("\nTotal usable near-fall periods across all participants and trials: %d\n", nTotal);
-
-if isempty(durations)
-    error("No usable near-fall events found after raw trial matching and minSamplesPerSegment filtering.");
-end
-
-%% 2) Average and standard deviation
-meanDur = mean(durations);
-stdDur  = std(durations);
-
-fprintf("Average duration: %.3f s\n", meanDur);
-fprintf("Standard deviation: %.3f s\n", stdDur);
-
-%% 3) Median and IQR
-medianDur = median(durations);
-Q1 = quantile(durations, 0.25);
-Q3 = quantile(durations, 0.75);
-IQR_val = Q3 - Q1;
-IQR_matlab = iqr(durations);
-
-fprintf("25th percentile (Q1): %.3f s and 75th percentile (Q3): %.3f s\n", Q1, Q3);
-fprintf("Median duration: %.3f s\n", medianDur);
-fprintf("Interquartile range (IQR): %.3f s\n", IQR_val);
-fprintf("MATLAB iqr check: %.3f s\n", IQR_matlab);
-
-%% 4) Compare near-falls prior to fall vs recovered near-falls
-dur_fall = durations(isFallAfter == 1);
-dur_rec  = durations(isFallAfter == 0);
-
-if ~isempty(dur_fall)
-    mean_fall = mean(dur_fall);
-else
-    mean_fall = NaN;
-end
-
-if ~isempty(dur_rec)
-    mean_rec = mean(dur_rec);
-else
-    mean_rec = NaN;
-end
-
-fprintf("\nMean duration (Near-Fall BEFORE Fall): %.3f s\n", mean_fall);
-fprintf("Mean duration (Recovered Near-Fall): %.3f s\n", mean_rec);
-
-if ~isempty(dur_fall) && ~isempty(dur_rec) && numel(dur_fall) > 1 && numel(dur_rec) > 1
-    [~, pValue] = ttest2(dur_fall, dur_rec);
-    fprintf("Two-sample t-test p-value: %.5f\n", pValue);
-else
-    pValue = NaN;
-    fprintf("Two-sample t-test p-value: NaN (not enough samples in one or both groups)\n");
-end
-
-%% 5) Participant results table
-pList = strings(0,1);
-recCounts = [];
-fallCounts = [];
-
-for p = 1:numel(participants_labels)
-
-    pID = participants_labels{p};
-
-    if ~isfield(raw_filt, pID)
-        continue
-    end
-
-    labelTrials = fieldnames(labels.(pID));
-    nRec_p = 0;
-    nFall_p = 0;
-
-    for t = 1:numel(labelTrials)
-
-        trLabel = labelTrials{t};
-
-        rawTrialField = resolveRawTrialField(raw_filt.(pID), trLabel);
-        if strlength(rawTrialField) == 0
-            continue
-        end
-
-        if ~isfield(raw_filt.(pID).(rawTrialField), 'Back')
-            continue
-        end
-
-        M = raw_filt.(pID).(rawTrialField).Back;
-        if size(M,1) < minSamplesPerSegment
-            continue
-        end
-
-        timeRaw = M(:,1);
-        nearFalls = eventStruct.(pID).(trLabel).NearFall;
-
-        for i = 1:size(nearFalls,1)
-            t0 = nearFalls(i,1);
-            t1 = nearFalls(i,2);
-            termLbl = nearFalls(i,3);
-
-            idx = timeRaw >= t0 & timeRaw <= t1;
-            if sum(idx) < minSamplesPerSegment
-                continue
-            end
-
-            if termLbl == 4
-                nFall_p = nFall_p + 1;
-            elseif termLbl == 3
-                nRec_p = nRec_p + 1;
-            end
-        end
-    end
-
-    pList(end+1,1) = string(pID);
-    recCounts(end+1,1) = nRec_p;
-    fallCounts(end+1,1) = nFall_p;
-end
-
-resultsTable = table(pList, recCounts, fallCounts, recCounts + fallCounts, ...
-    'VariableNames', {'Participant', 'NearFall_Recovered', 'NearFall_Fell', 'Total'});
-
-overallRow = table("OVERALL", sum(recCounts), sum(fallCounts), ...
-    sum(recCounts) + sum(fallCounts), ...
-    'VariableNames', {'Participant', 'NearFall_Recovered', 'NearFall_Fell', 'Total'});
-
-resultsTable = [resultsTable; overallRow];
-
-fprintf("\n=============================\n");
-disp(resultsTable);
-fprintf("=============================\n");
-
-%% 6) Histogram - all near-fall durations
-mean_val = mean(durations);
-median_val = median(durations);
-Q1_all = prctile(durations,25);
-Q3_all = prctile(durations,75);
-
-figure
-histogram(durations,25,'FaceColor',[0.3 0.3 0.3],'EdgeColor','none')
-hold on
-xline(mean_val,'r','LineWidth',1,'DisplayName','Mean')
-xline(median_val,'b','LineWidth',1,'DisplayName','Median')
-xline(Q1_all,'k--','LineWidth',1,'DisplayName','Q1')
-xline(Q3_all,'k--','LineWidth',1,'DisplayName','Q3')
-xlabel('Near-fall Duration (s)')
-ylabel('Number of Events')
-title('Distribution of Usable Near-Fall Durations')
-legend('Near-fall durations','Mean','Median','Q1','Q3')
-grid on
-hold off
-
-%% 7) Histogram - recovered near-falls
-if ~isempty(dur_rec)
-    mean_rec = mean(dur_rec);
-    median_rec = median(dur_rec);
-    Q1_rec = prctile(dur_rec,25);
-    Q3_rec = prctile(dur_rec,75);
-
-    figure
-    histogram(dur_rec,20,'FaceColor',[0.4 0.4 0.4],'EdgeColor','none')
-    hold on
-    xline(mean_rec,'r','LineWidth',2,'DisplayName','Mean')
-    xline(median_rec,'b','LineWidth',2,'DisplayName','Median')
-    xline(Q1_rec,'k--','LineWidth',2,'DisplayName','Q1')
-    xline(Q3_rec,'k--','LineWidth',2,'DisplayName','Q3')
-    xlabel('Near-fall Duration (s)')
-    ylabel('Number of Events')
-    title('Distribution of Usable Near-fall Durations (Recovery)')
-    legend('Near-fall durations','Mean','Median','Q1','Q3','Location','best')
-    grid on
-    hold off
-end
-
-%% 8) Histogram - near-falls that transition to fall
-if ~isempty(dur_fall)
-    mean_fall = mean(dur_fall);
-    median_fall = median(dur_fall);
-    Q1_fall = prctile(dur_fall,25);
-    Q3_fall = prctile(dur_fall,75);
-
-    figure
-    histogram(dur_fall,20,'FaceColor',[0.4 0.4 0.4],'EdgeColor','none')
-    hold on
-    xline(mean_fall,'r','LineWidth',2,'DisplayName','Mean')
-    xline(median_fall,'b','LineWidth',2,'DisplayName','Median')
-    xline(Q1_fall,'k--','LineWidth',2,'DisplayName','Q1')
-    xline(Q3_fall,'k--','LineWidth',2,'DisplayName','Q3')
-    xlabel('Near-fall Duration (s)')
-    ylabel('Number of Events')
-    title('Distribution of Usable Near-fall Durations (Transition to Fall)')
-    legend('Near-fall durations','Mean','Median','Q1','Q3','Location','best')
-    grid on
-    hold off
-end
-
-
-
-
-
+disp("Filtering complete for TRAINING data.");
 
 %% ============================================================
-%% SECTION C - ML MODEL WITH FIXED LABEL-TO-RAW TRIAL MATCHING
+%% SECTION B - FILTER TEST DATA
 %% ============================================================
 
-% This section builds ML samples from:
-% 0 = ADL
-% 1 = NearFall
-% 2 = Fall
-%
-% Consistency rule:
-% - Random Forest and SVM use the SAME extracted samples
-% - SAME participant split
-% - SAME balanced training set
-% - SAME held-out test set
+test_data_filt = test_data;
+participants_test = string(fieldnames(test_data));
 
-% ---- MANUAL PARTICIPANT SPLIT ----
-testParticipants = ["P1960","P2070","P2995"];
-allParticipants = string(fieldnames(raw_filt));
-trainParticipants = setdiff(allParticipants, testParticipants);
+for p = 1:numel(participants_test)
+    pID = participants_test(p);
+    trialNames = string(fieldnames(test_data.(pID)));
 
-%% C1) Build feature matrix using LABEL TRIALS as master list
-X = [];
-Y = [];
-sampleParticipant = strings(0,1);
-sampleTrial = strings(0,1);
+    for tt = 1:numel(trialNames)
+        tr = trialNames(tt);
+        X = test_data.(pID).(tr);
 
-participants = fieldnames(labels);
-
-for p = 1:numel(participants)
-
-    pID = participants{p};
-
-    if ~isfield(raw_filt, pID)
-        continue;
-    end
-
-    labelTrials = fieldnames(labels.(pID));
-
-    fprintf("\nBuilding ML samples for participant %s (%d/%d)\n", pID, p, numel(participants));
-
-    for tt = 1:numel(labelTrials)
-
-        trLabel = labelTrials{tt};
-
-        rawTrialField = resolveRawTrialField(raw_filt.(pID), trLabel);
-
-        if strlength(rawTrialField) == 0
-            fprintf("  No raw trial match found for %s %s\n", pID, trLabel);
-            continue;
+        if isfield(X,"Back")
+            test_data_filt.(pID).(tr).Back = filterIMU_Matrix(X.Back, IMU.lowpass_fc);
         end
 
-        if ~isfield(raw_filt.(pID).(rawTrialField), 'Back')
-            continue;
+        if isfield(X,"Sternum")
+            test_data_filt.(pID).(tr).Sternum = filterIMU_Matrix(X.Sternum, IMU.lowpass_fc);
         end
 
-        M = raw_filt.(pID).(rawTrialField).Back;
-        if size(M,1) < minSamplesPerSegment
-            continue;
+        if isfield(X,"Left_Thigh")
+            test_data_filt.(pID).(tr).Left_Thigh = filterIMU_Matrix(X.Left_Thigh, IMU.lowpass_fc);
         end
 
-        t = M(:,1);
-        if isempty(t)
-            continue;
+        if isfield(X,"Right_Thigh")
+            test_data_filt.(pID).(tr).Right_Thigh = filterIMU_Matrix(X.Right_Thigh, IMU.lowpass_fc);
         end
 
-        nearFallsFull = eventStruct.(pID).(trLabel).NearFall;
-        fallsFull     = eventStruct.(pID).(trLabel).Fall;
-
-        % Keep only usable events
-        nearFalls = filterUsableIntervals(nearFallsFull, t, minSamplesPerSegment);
-        falls     = filterUsableIntervals(fallsFull, t, minSamplesPerSegment);
-
-        fprintf("  %s -> %s | NF=%d Fall=%d\n", trLabel, rawTrialField, size(nearFalls,1), size(falls,1));
-
-        %% ---- TRUE NEAR-FALL SEGMENTS ----
-        for i = 1:size(nearFalls,1)
-            t0 = nearFalls(i,1);
-            t1 = nearFalls(i,2);
-
-            idx = t >= t0 & t <= t1;
-            if sum(idx) < minSamplesPerSegment
-                continue;
-            end
-
-            W = M(idx,:);
-            feat = extractSegmentFeatures(W);
-
-            X(end+1,:) = feat;
-            Y(end+1,1) = 1;
-            sampleParticipant(end+1,1) = string(pID);
-            sampleTrial(end+1,1) = string(trLabel);
+        if isfield(X,"Left_Arm")
+            test_data_filt.(pID).(tr).Left_Arm = filterIMU_Matrix(X.Left_Arm, IMU.lowpass_fc);
         end
 
-        %% ---- TRUE FALL SEGMENTS ----
-        for i = 1:size(falls,1)
-            t0 = falls(i,1);
-            t1 = falls(i,2);
-
-            idx = t >= t0 & t <= t1;
-            if sum(idx) < minSamplesPerSegment
-                continue;
-            end
-
-            W = M(idx,:);
-            feat = extractSegmentFeatures(W);
-
-            X(end+1,:) = feat;
-            Y(end+1,1) = 2;
-            sampleParticipant(end+1,1) = string(pID);
-            sampleTrial(end+1,1) = string(trLabel);
+        if isfield(X,"Right_Arm")
+            test_data_filt.(pID).(tr).Right_Arm = filterIMU_Matrix(X.Right_Arm, IMU.lowpass_fc);
         end
 
-        %% ---- CLEAN ADL WINDOWS ----
-        allEvents = [];
-
-        if ~isempty(nearFalls)
-            allEvents = [allEvents; nearFalls(:,1:2)];
+        if isfield(X,"ECG")
+            test_data_filt.(pID).(tr).ECG = filterECG_Matrix(X.ECG, ECG.bandpass_f1, ECG.bandpass_f2, ...
+                ECG.use_notch, ECG.notch_f1, ECG.notch_f2);
         end
 
-        if ~isempty(falls)
-            allEvents = [allEvents; falls(:,1:2)];
-        end
-
-        tStartAll = t(1);
-        tEndAll   = t(end);
-        winStarts = tStartAll:adlStep_s:(tEndAll - adlWindow_s);
-
-        for w = 1:numel(winStarts)
-            w0 = winStarts(w);
-            w1 = w0 + adlWindow_s;
-
-            if overlapsBuffered(w0, w1, allEvents, eventBuffer_s)
-                continue;
-            end
-
-            idx = t >= w0 & t < w1;
-            if sum(idx) < minSamplesPerSegment
-                continue;
-            end
-
-            W = M(idx,:);
-            feat = extractSegmentFeatures(W);
-
-            X(end+1,:) = feat;
-            Y(end+1,1) = 0;
-            sampleParticipant(end+1,1) = string(pID);
-            sampleTrial(end+1,1) = string(trLabel);
+        if isfield(X,"GSS")
+            test_data_filt.(pID).(tr).GSS = filterGSR_Matrix(X.GSS, GSR.lowpass_fc);
         end
     end
 end
 
-featNames = getSegmentFeatureNames();
-Ycat = categorical(Y, [0 1 2], {'ADL','NearFall','Fall'});
+disp("Filtering complete for TEST data.");
 
-fprintf("\nOverall class counts:\n");
-disp(countcats(Ycat))
-disp(categories(Ycat))
+%% ============================================================
+%% SECTION C - BUILD EVENT STRUCT FROM TRAINING LABELS
+%% ============================================================
 
-%% C2) Print counts by participant
-fprintf('\nCounts by participant:\n');
-uP = unique(sampleParticipant);
-for i = 1:numel(uP)
-    idx = sampleParticipant == uP(i);
-    Yi = Ycat(idx);
-    fprintf('%s  ADL=%d  NF=%d  Fall=%d\n', uP(i), ...
-        sum(Yi=='ADL'), sum(Yi=='NearFall'), sum(Yi=='Fall'));
-end
+eventStruct_train = buildEventStruct(labels_train);
+disp("Event intervals built from TRAINING labels.");
 
-%% C3) Split using manual participant split
-isTrain = ismember(sampleParticipant, trainParticipants);
-isTest  = ismember(sampleParticipant, testParticipants);
+%% ============================================================
+%% SECTION D - BUILD TRAINING FEATURE MATRIX
+%% ============================================================
 
-XTrain = X(isTrain,:);
-YTrain = Ycat(isTrain);
+[XTrain, YTrain, trainParticipant, trainTrial] = buildFeatureMatrixFromLabeledSet( ...
+    raw_train_filt, labels_train, eventStruct_train, adlWindow_s, adlStep_s, eventBuffer_s, minSamplesPerSegment);
 
-XTest = X(isTest,:);
-YTest = Ycat(isTest);
+featNames = getMultiSensorFeatureNames();
+YTrain_cat = categorical(YTrain, [0 1 2], {'ADL','NearFall','Fall'});
 
-fprintf("\nTrain participants:\n");
-disp(trainParticipants')
+fprintf("\nOverall TRAINING class counts:\n");
+disp(countcats(YTrain_cat))
+disp(categories(YTrain_cat))
 
-fprintf("Test participants:\n");
-disp(testParticipants')
-
-fprintf("Training samples: %d\n", size(XTrain,1));
-fprintf("Testing samples: %d\n", size(XTest,1));
-
-fprintf('\nTraining class counts:\n');
-disp(countcats(YTrain))
-disp(categories(YTrain))
-
-fprintf('\nTesting class counts:\n');
-disp(countcats(YTest))
-disp(categories(YTest))
-
-%% C4) Balance training data
-idxADL  = find(YTrain == 'ADL');
-idxNF   = find(YTrain == 'NearFall');
-idxFall = find(YTrain == 'Fall');
+%% Balance training data
+idxADL  = find(YTrain_cat == 'ADL');
+idxNF   = find(YTrain_cat == 'NearFall');
+idxFall = find(YTrain_cat == 'Fall');
 
 targetPerClass = max([numel(idxNF), numel(idxFall), 1]);
 
@@ -668,21 +243,103 @@ idxKeep = [idxADL_keep; idxNF_keep; idxFall_keep];
 idxKeep = idxKeep(randperm(numel(idxKeep)));
 
 XTrain_bal = XTrain(idxKeep,:);
-YTrain_bal = YTrain(idxKeep);
+YTrain_bal = YTrain_cat(idxKeep);
 
 fprintf('\nBalanced training class counts:\n');
 disp(countcats(YTrain_bal))
 disp(categories(YTrain_bal))
 
-%% C5) Train Random Forest
+%% ============================================================
+%% SECTION E - BUILD TEST FEATURE MATRIX
+%% ============================================================
+
+XTest = [];
+testParticipant = strings(0,1);
+testTrial = strings(0,1);
+testWinStart = [];
+testWinEnd = [];
+
+participants_test = fieldnames(test_data_filt);
+
+for p = 1:numel(participants_test)
+
+    pID = participants_test{p};
+    trialNames = fieldnames(test_data_filt.(pID));
+
+    fprintf("\nBuilding TEST windows for participant %s (%d/%d)\n", pID, p, numel(participants_test));
+
+    for tt = 1:numel(trialNames)
+
+        tr = trialNames{tt};
+
+        sensorMap = getSensorMap(test_data_filt.(pID).(tr));
+        if ~sensorMap.hasAny
+            fprintf("  No usable sensors found for %s %s\n", pID, tr);
+            continue;
+        end
+
+        % choose a reference time vector from the core sensor if possible
+        refField = sensorMap.core;
+        if strlength(refField) == 0
+            refField = sensorMap.limb1;
+        end
+        if strlength(refField) == 0
+            refField = sensorMap.limb2;
+        end
+        if strlength(refField) == 0
+            fprintf("  No usable IMU reference field found for %s %s\n", pID, tr);
+            continue;
+        end
+
+        Mref = test_data_filt.(pID).(tr).(refField);
+        if size(Mref,1) < minSamplesPerSegment
+            continue;
+        end
+
+        t = Mref(:,1);
+        if isempty(t)
+            continue;
+        end
+
+        tStartAll = t(1);
+        tEndAll   = t(end);
+        winStarts = tStartAll:adlStep_s:(tEndAll - adlWindow_s);
+
+        fprintf("  %s | windows=%d\n", tr, numel(winStarts));
+
+        for w = 1:numel(winStarts)
+            w0 = winStarts(w);
+            w1 = w0 + adlWindow_s;
+
+            feat = extractMultiSensorWindowFeatures(test_data_filt.(pID).(tr), sensorMap, w0, w1, minSamplesPerSegment);
+
+            if isempty(feat)
+                continue;
+            end
+
+            XTest(end+1,:) = feat;
+            testParticipant(end+1,1) = string(pID);
+            testTrial(end+1,1) = string(tr);
+            testWinStart(end+1,1) = w0;
+            testWinEnd(end+1,1) = w1;
+        end
+    end
+end
+
+fprintf("\nTotal TEST windows created from unlabeled test data: %d\n", size(XTest,1));
+
+%% ============================================================
+%% SECTION F - RANDOM FOREST
+%% ============================================================
+
 rfModel = TreeBagger(numTrees, XTrain_bal, YTrain_bal, ...
     'Method', 'classification', ...
     'OOBPrediction', 'On', ...
     'OOBPredictorImportance', 'On');
 
-disp("Random forest trained.");
+disp("Random Forest trained.");
 
-%% C6) Random Forest OOB training confusion matrix
+%% F1) Random Forest OOB training confusion matrix
 predTrain_rf_oob = oobPredict(rfModel);
 predTrain_rf_oob = categorical(predTrain_rf_oob, {'ADL','NearFall','Fall'});
 
@@ -701,40 +358,33 @@ disp(array2table(mat_rf_oob, ...
 rfTrainAcc_oob = mean(predTrain_rf_oob == YTrain_bal);
 fprintf("\nRandom Forest OOB training accuracy: %.3f\n", rfTrainAcc_oob);
 
-%% C7) Random Forest TEST confusion matrix
+%% F2) Random Forest predictions on test data
 predTest_rf = predict(rfModel, XTest);
 predTest_rf = categorical(predTest_rf, {'ADL','NearFall','Fall'});
 
-fprintf('\nRandom Forest predicted test class counts:\n');
+fprintf('\nRandom Forest predicted TEST class counts:\n');
 disp(countcats(predTest_rf))
 disp(categories(predTest_rf))
 
-rfTestAcc = mean(predTest_rf == YTest);
-fprintf("\nRandom Forest test accuracy: %.3f\n", rfTestAcc);
+rfTestResults = table(testParticipant, testTrial, testWinStart, testWinEnd, predTest_rf, ...
+    'VariableNames', {'Participant','Trial','WindowStart_s','WindowEnd_s','PredictedLabel'});
 
-mat_rf_test = confusionmat(YTest, predTest_rf, ...
-    'Order', categorical({'ADL','NearFall','Fall'}));
+rfLabelNum = nan(height(rfTestResults),1);
+rfLabelNum(rfTestResults.PredictedLabel == 'ADL') = 0;
+rfLabelNum(rfTestResults.PredictedLabel == 'NearFall') = 1;
+rfLabelNum(rfTestResults.PredictedLabel == 'Fall') = 2;
+rfTestResults.PredictedLabelNum = rfLabelNum;
 
-figure;
-confusionchart(mat_rf_test, {'ADL','NearFall','Fall'});
-title('RANDOM FOREST TEST CONFUSION MATRIX')
+disp("Random Forest test predictions table created: rfTestResults");
 
-disp("Random Forest test confusion matrix rows=true, cols=predicted")
-disp(array2table(mat_rf_test, ...
-    'VariableNames', {'Pred_ADL','Pred_NearFall','Pred_Fall'}, ...
-    'RowNames', {'True_ADL','True_NearFall','True_Fall'}))
-
-
-
-
-%% C8) Random Forest feature importance
+%% F3) Random Forest feature importance
 importance = rfModel.OOBPermutedPredictorDeltaError(:);
 [importanceSorted, idxSort] = sort(importance, 'descend');
 
 disp("Top Random Forest feature importances:")
-topN = min(10, numel(idxSort));
+topN = min(15, numel(idxSort));
 for i = 1:topN
-    fprintf("%2d. %-25s %.4f\n", i, featNames{idxSort(i)}, importanceSorted(i));
+    fprintf("%2d. %-35s %.4f\n", i, featNames{idxSort(i)}, importanceSorted(i));
 end
 
 figure;
@@ -746,12 +396,32 @@ ylabel('OOB Permuted Predictor Delta Error');
 title('Top Random Forest Feature Importances');
 
 %% ============================================================
-%% SECTION D - SVM USING THE EXACT SAME DATA AS RANDOM FOREST
+%% RANDOM FOREST EVENT TABLES FOR SUBMISSION
 %% ============================================================
 
-rng(1);
+rfSubmissionTables = buildSubmissionTables(rfTestResults);
 
-%% D1) Standardize using ONLY balanced training set statistics
+disp("Random Forest submission tables created:")
+disp(fieldnames(rfSubmissionTables))
+
+rfParticipants = fieldnames(rfSubmissionTables);
+for p = 1:numel(rfParticipants)
+    pID = rfParticipants{p};
+    rfTrials = fieldnames(rfSubmissionTables.(pID));
+
+    for t = 1:numel(rfTrials)
+        tr = rfTrials{t};
+        Tsub = rfSubmissionTables.(pID).(tr);
+
+        outName = sprintf("RF_%s_%s.csv", pID, tr);
+        writematrix(Tsub, outName);
+    end
+end
+
+%% ============================================================
+%% SECTION G - SVM
+%% ============================================================
+
 mu_train = mean(XTrain_bal, 1);
 sig_train = std(XTrain_bal, 0, 1);
 sig_train(sig_train == 0) = 1;
@@ -759,21 +429,19 @@ sig_train(sig_train == 0) = 1;
 XTrain_svm = (XTrain_bal - mu_train) ./ sig_train;
 XTest_svm  = (XTest      - mu_train) ./ sig_train;
 
-%% D2) Set up SVM learner
 t_svm = templateSVM( ...
     'KernelFunction','linear', ...
     'KernelScale','auto', ...
     'Standardize',false);
 
-%% D3) Train SVM on SAME balanced training data as RF
 Mdl_svm = fitcecoc(XTrain_svm, YTrain_bal, ...
     'Learners', t_svm, ...
     'Prior', 'uniform');
 
 disp("SVM trained.");
 
-%% D4) SVM cross-validated TRAINING confusion matrix
-svmCV = crossval(Mdl_svm, "KFold", 5);
+%% G1) SVM cross-validated training confusion matrix
+svmCV = crossval(Mdl_svm, "KFold", kfolds);
 predTrain_svm_cv = kfoldPredict(svmCV);
 
 mat_svm_cv = confusionmat(YTrain_bal, predTrain_svm_cv, ...
@@ -791,38 +459,122 @@ disp(array2table(mat_svm_cv, ...
 svmTrainAcc_cv = mean(predTrain_svm_cv == YTrain_bal);
 fprintf("\nSVM cross-validated training accuracy: %.3f\n", svmTrainAcc_cv);
 
-%% D5) SVM TEST confusion matrix using SAME XTest/YTest as RF
+%% G2) SVM predictions on test data
 predTest_svm = predict(Mdl_svm, XTest_svm);
 
-mat_svm_test = confusionmat(YTest, predTest_svm, ...
-    'Order', categorical({'ADL','NearFall','Fall'}));
-
-figure;
-confusionchart(mat_svm_test, {'ADL','NearFall','Fall'});
-title("SVM TEST CONFUSION MATRIX")
-
-disp("SVM test confusion matrix rows=true, cols=predicted")
-disp(array2table(mat_svm_test, ...
-    'VariableNames', {'Pred_ADL','Pred_NearFall','Pred_Fall'}, ...
-    'RowNames', {'True_ADL','True_NearFall','True_Fall'}))
-
-svmTestAcc = mean(predTest_svm == YTest);
-fprintf("\nSVM test accuracy: %.3f\n", svmTestAcc);
-
-fprintf("\nSVM predicted test class counts:\n");
+fprintf("\nSVM predicted TEST class counts:\n");
 disp(countcats(predTest_svm))
 disp(categories(predTest_svm))
+
+svmTestResults = table(testParticipant, testTrial, testWinStart, testWinEnd, predTest_svm, ...
+    'VariableNames', {'Participant','Trial','WindowStart_s','WindowEnd_s','PredictedLabel'});
+
+svmLabelNum = nan(height(svmTestResults),1);
+svmLabelNum(svmTestResults.PredictedLabel == 'ADL') = 0;
+svmLabelNum(svmTestResults.PredictedLabel == 'NearFall') = 1;
+svmLabelNum(svmTestResults.PredictedLabel == 'Fall') = 2;
+svmTestResults.PredictedLabelNum = svmLabelNum;
+
+disp("SVM test predictions table created: svmTestResults");
+
+%% ============================================================
+%% SVM EVENT TABLES FOR SUBMISSION
+%% ============================================================
+
+svmSubmissionTables = buildSubmissionTables(svmTestResults);
+
+disp("SVM submission tables created:")
+disp(fieldnames(svmSubmissionTables))
+
+svmParticipants = fieldnames(svmSubmissionTables);
+for p = 1:numel(svmParticipants)
+    pID = svmParticipants{p};
+    svmTrials = fieldnames(svmSubmissionTables.(pID));
+
+    for t = 1:numel(svmTrials)
+        tr = svmTrials{t};
+        Tsub = svmSubmissionTables.(pID).(tr);
+
+        outName = sprintf("SVM_%s_%s.csv", pID, tr);
+        writematrix(Tsub, outName);
+    end
+end
 
 %% ============================================================
 %% LOCAL FUNCTIONS
 %% ============================================================
 
+function rawStruct = autoFindRawSensorStruct(S, labelsRef)
+% Find the raw sensor struct using participant IDs from labels
+
+    rawStruct = [];
+
+    participantIDs = fieldnames(labelsRef);
+    if isempty(participantIDs)
+        error("labelsRef is empty.");
+    end
+
+    probePID = participantIDs{1};
+    names = fieldnames(S);
+
+    for k = 1:numel(names)
+        nm = names{k};
+
+        if strcmp(nm, "clean_labels")
+            continue;
+        end
+
+        candidate = S.(nm);
+
+        if ~isstruct(candidate)
+            continue;
+        end
+
+        if ~isfield(candidate, probePID)
+            continue;
+        end
+
+        if ~isstruct(candidate.(probePID))
+            continue;
+        end
+
+        trialFields = fieldnames(candidate.(probePID));
+        if isempty(trialFields)
+            continue;
+        end
+
+        foundUsableTrial = false;
+
+        for t = 1:numel(trialFields)
+            tr = trialFields{t};
+
+            if ~isstruct(candidate.(probePID).(tr))
+                continue;
+            end
+
+            sf = fieldnames(candidate.(probePID).(tr));
+
+            hasCoreIMU = any(strcmp(sf,"Back")) || any(strcmp(sf,"Sternum"));
+            hasOtherSensors = any(strcmp(sf,"ECG")) && any(strcmp(sf,"GSS"));
+
+            if hasCoreIMU && hasOtherSensors
+                foundUsableTrial = true;
+                break;
+            end
+        end
+
+        if foundUsableTrial
+            rawStruct = candidate;
+            fprintf("Using raw sensor struct: S.%s\n", nm);
+            return
+        end
+    end
+
+    error("Could not auto-find the raw training sensor struct.");
+end
+
 function eventStruct = buildEventStruct(labels)
-% Builds a shared eventStruct used by both Section B and Section C
-%
 % NearFall rows stored as [t0 t1 termLabel]
-% where termLabel is 3 for recovered or 4 for fell
-%
 % Fall rows stored as [t0 t1]
 
     eventStruct = struct();
@@ -850,7 +602,6 @@ function eventStruct = buildEventStruct(labels)
             eventLabel = T(:,1);
             time_s = T(:,2)/1000;
 
-            % Near-fall = label 2 to first subsequent 3 or 4
             nfStartRows = find(eventLabel == 2);
             for i = 1:numel(nfStartRows)
                 r0 = nfStartRows(i);
@@ -876,7 +627,6 @@ function eventStruct = buildEventStruct(labels)
                 end
             end
 
-            % Fall = label 4 to first subsequent 5
             fallRows = find(eventLabel == 4);
             for i = 1:numel(fallRows)
                 r0 = fallRows(i);
@@ -907,9 +657,293 @@ function eventStruct = buildEventStruct(labels)
     end
 end
 
+function [X, Y, sampleParticipant, sampleTrial] = buildFeatureMatrixFromLabeledSet(raw_filt, labels, eventStruct, adlWindow_s, adlStep_s, eventBuffer_s, minSamplesPerSegment)
+
+    X = [];
+    Y = [];
+    sampleParticipant = strings(0,1);
+    sampleTrial = strings(0,1);
+
+    participants = fieldnames(labels);
+
+    for p = 1:numel(participants)
+
+        pID = participants{p};
+
+        if ~isfield(raw_filt, pID)
+            continue;
+        end
+
+        labelTrials = fieldnames(labels.(pID));
+
+        fprintf("\nBuilding labeled feature matrix for participant %s (%d/%d)\n", pID, p, numel(participants));
+
+        for tt = 1:numel(labelTrials)
+
+            trLabel = labelTrials{tt};
+            rawTrialField = resolveRawTrialField(raw_filt.(pID), trLabel);
+
+            if strlength(rawTrialField) == 0
+                fprintf("  No raw trial match found for %s %s\n", pID, trLabel);
+                continue;
+            end
+
+            sensorMap = getSensorMap(raw_filt.(pID).(rawTrialField));
+
+            if ~sensorMap.hasAny
+                fprintf("  No usable sensor combination found for %s %s\n", pID, trLabel);
+                continue;
+            end
+
+            refField = sensorMap.core;
+            if strlength(refField) == 0
+                refField = sensorMap.limb1;
+            end
+            if strlength(refField) == 0
+                refField = sensorMap.limb2;
+            end
+            if strlength(refField) == 0
+                fprintf("  No IMU reference field found for %s %s\n", pID, trLabel);
+                continue;
+            end
+
+            Mref = raw_filt.(pID).(rawTrialField).(refField);
+            if size(Mref,1) < minSamplesPerSegment
+                continue;
+            end
+
+            t = Mref(:,1);
+            if isempty(t)
+                continue;
+            end
+
+            nearFallsFull = eventStruct.(pID).(trLabel).NearFall;
+            fallsFull     = eventStruct.(pID).(trLabel).Fall;
+
+            nearFalls = filterUsableIntervals(nearFallsFull, t, minSamplesPerSegment);
+            falls     = filterUsableIntervals(fallsFull, t, minSamplesPerSegment);
+
+            fprintf("  %s -> %s | NF=%d Fall=%d\n", trLabel, rawTrialField, size(nearFalls,1), size(falls,1));
+
+            for i = 1:size(nearFalls,1)
+                t0 = nearFalls(i,1);
+                t1 = nearFalls(i,2);
+
+                feat = extractMultiSensorWindowFeatures(raw_filt.(pID).(rawTrialField), sensorMap, t0, t1, minSamplesPerSegment);
+                if isempty(feat)
+                    continue;
+                end
+
+                X(end+1,:) = feat;
+                Y(end+1,1) = 1;
+                sampleParticipant(end+1,1) = string(pID);
+                sampleTrial(end+1,1) = string(trLabel);
+            end
+
+            for i = 1:size(falls,1)
+                t0 = falls(i,1);
+                t1 = falls(i,2);
+
+                feat = extractMultiSensorWindowFeatures(raw_filt.(pID).(rawTrialField), sensorMap, t0, t1, minSamplesPerSegment);
+                if isempty(feat)
+                    continue;
+                end
+
+                X(end+1,:) = feat;
+                Y(end+1,1) = 2;
+                sampleParticipant(end+1,1) = string(pID);
+                sampleTrial(end+1,1) = string(trLabel);
+            end
+
+            allEvents = [];
+
+            if ~isempty(nearFalls)
+                allEvents = [allEvents; nearFalls(:,1:2)];
+            end
+
+            if ~isempty(falls)
+                allEvents = [allEvents; falls(:,1:2)];
+            end
+
+            tStartAll = t(1);
+            tEndAll   = t(end);
+            winStarts = tStartAll:adlStep_s:(tEndAll - adlWindow_s);
+
+            for w = 1:numel(winStarts)
+                w0 = winStarts(w);
+                w1 = w0 + adlWindow_s;
+
+                if overlapsBuffered(w0, w1, allEvents, eventBuffer_s)
+                    continue;
+                end
+
+                feat = extractMultiSensorWindowFeatures(raw_filt.(pID).(rawTrialField), sensorMap, w0, w1, minSamplesPerSegment);
+                if isempty(feat)
+                    continue;
+                end
+
+                X(end+1,:) = feat;
+                Y(end+1,1) = 0;
+                sampleParticipant(end+1,1) = string(pID);
+                sampleTrial(end+1,1) = string(trLabel);
+            end
+        end
+    end
+end
+
+function sensorMap = getSensorMap(trialStruct)
+% Build a consistent sensor slot mapping:
+% core  = Back preferred, otherwise Sternum
+% limb1 = Left_Thigh preferred, otherwise Left_Arm
+% limb2 = Right_Thigh preferred, otherwise Right_Arm
+
+    sensorMap = struct();
+    sensorMap.core  = "";
+    sensorMap.limb1 = "";
+    sensorMap.limb2 = "";
+    sensorMap.ecg   = "";
+    sensorMap.gss   = "";
+    sensorMap.hasAny = false;
+
+    if isfield(trialStruct, 'Back')
+        sensorMap.core = "Back";
+    elseif isfield(trialStruct, 'Sternum')
+        sensorMap.core = "Sternum";
+    end
+
+    if isfield(trialStruct, 'Left_Thigh')
+        sensorMap.limb1 = "Left_Thigh";
+    elseif isfield(trialStruct, 'Left_Arm')
+        sensorMap.limb1 = "Left_Arm";
+    end
+
+    if isfield(trialStruct, 'Right_Thigh')
+        sensorMap.limb2 = "Right_Thigh";
+    elseif isfield(trialStruct, 'Right_Arm')
+        sensorMap.limb2 = "Right_Arm";
+    end
+
+    if isfield(trialStruct, 'ECG')
+        sensorMap.ecg = "ECG";
+    end
+
+    if isfield(trialStruct, 'GSS')
+        sensorMap.gss = "GSS";
+    end
+
+    sensorMap.hasAny = strlength(sensorMap.core) > 0 || ...
+                       strlength(sensorMap.limb1) > 0 || ...
+                       strlength(sensorMap.limb2) > 0 || ...
+                       strlength(sensorMap.ecg) > 0 || ...
+                       strlength(sensorMap.gss) > 0;
+end
+
+function feat = extractMultiSensorWindowFeatures(trialStruct, sensorMap, t0, t1, minSamplesPerSegment)
+% Concatenate features from:
+% core IMU + limb1 IMU + limb2 IMU + ECG + GSS
+% Returns [] if required windowing fails for all usable sensors
+
+    feat = [];
+
+    % Core IMU
+    if strlength(sensorMap.core) > 0
+        M = trialStruct.(sensorMap.core);
+        idx = M(:,1) >= t0 & M(:,1) <= t1;
+        if sum(idx) >= minSamplesPerSegment
+            feat = [feat, extractIMUFeatures(M(idx,:))];
+        else
+            feat = [feat, nan(1,80)];
+        end
+    else
+        feat = [feat, nan(1,80)];
+    end
+
+    % Limb1 IMU
+    if strlength(sensorMap.limb1) > 0
+        M = trialStruct.(sensorMap.limb1);
+        idx = M(:,1) >= t0 & M(:,1) <= t1;
+        if sum(idx) >= minSamplesPerSegment
+            feat = [feat, extractIMUFeatures(M(idx,:))];
+        else
+            feat = [feat, nan(1,80)];
+        end
+    else
+        feat = [feat, nan(1,80)];
+    end
+
+    % Limb2 IMU
+    if strlength(sensorMap.limb2) > 0
+        M = trialStruct.(sensorMap.limb2);
+        idx = M(:,1) >= t0 & M(:,1) <= t1;
+        if sum(idx) >= minSamplesPerSegment
+            feat = [feat, extractIMUFeatures(M(idx,:))];
+        else
+            feat = [feat, nan(1,80)];
+        end
+    else
+        feat = [feat, nan(1,80)];
+    end
+
+    % ECG
+    if strlength(sensorMap.ecg) > 0
+        M = trialStruct.(sensorMap.ecg);
+        idx = M(:,1) >= t0 & M(:,1) <= t1;
+        if sum(idx) >= minSamplesPerSegment
+            feat = [feat, extract1DSignalFeatures(M(idx,2))];
+        else
+            feat = [feat, nan(1,10)];
+        end
+    else
+        feat = [feat, nan(1,10)];
+    end
+
+    % GSS
+    if strlength(sensorMap.gss) > 0
+        M = trialStruct.(sensorMap.gss);
+        idx = M(:,1) >= t0 & M(:,1) <= t1;
+        if sum(idx) >= minSamplesPerSegment
+            feat = [feat, extract1DSignalFeatures(M(idx,2))];
+        else
+            feat = [feat, nan(1,10)];
+        end
+    else
+        feat = [feat, nan(1,10)];
+    end
+
+    % Replace NaNs with column-neutral zeros for model compatibility
+    feat(isnan(feat)) = 0;
+end
+
+function feat = extractIMUFeatures(W)
+% W = [t ax ay az wx wy wz]
+
+    ax = W(:,2);
+    ay = W(:,3);
+    az = W(:,4);
+    wx = W(:,5);
+    wy = W(:,6);
+    wz = W(:,7);
+
+    amag = vecnorm(W(:,2:4),2,2);
+    wmag = vecnorm(W(:,5:7),2,2);
+
+    feat = [ ...
+        basic1DFeatures(ax), ...
+        basic1DFeatures(ay), ...
+        basic1DFeatures(az), ...
+        basic1DFeatures(wx), ...
+        basic1DFeatures(wy), ...
+        basic1DFeatures(wz), ...
+        basic1DFeatures(amag), ...
+        basic1DFeatures(wmag) ...
+        ];
+end
+
+function feat = extract1DSignalFeatures(x)
+    feat = basic1DFeatures(x);
+end
+
 function intervalsOut = filterUsableIntervals(intervalsIn, t, minSamplesPerSegment)
-% Keeps only intervals that have enough samples in the raw signal
-% Preserves the number of columns even when empty
 
     if isempty(intervalsIn)
         intervalsOut = intervalsIn;
@@ -929,9 +963,8 @@ function intervalsOut = filterUsableIntervals(intervalsIn, t, minSamplesPerSegme
     end
 end
 
-
 function M_f = filterIMU_Matrix(M, fc_lowpass)
-% M is Nx7: [t, ax, ay, az, wx, wy, wz]
+% M is Nx7: [t ax ay az wx wy wz]
 
     t = M(:,1);
     sig = M(:,2:7);
@@ -953,7 +986,7 @@ function M_f = filterIMU_Matrix(M, fc_lowpass)
 end
 
 function M_f = filterECG_Matrix(M, f1, f2, use_notch, notch_f1, notch_f2)
-% M is Nx2: [t, ecg]
+% M is Nx2: [t ecg]
 
     t = M(:,1);
     x = M(:,2);
@@ -987,7 +1020,7 @@ function M_f = filterECG_Matrix(M, f1, f2, use_notch, notch_f1, notch_f2)
 end
 
 function M_f = filterGSR_Matrix(M, fc_lowpass)
-% M is Nx2: [t, gss]
+% M is Nx2: [t gss]
 
     t = M(:,1);
     x = M(:,2);
@@ -1019,127 +1052,7 @@ function Fs = estimateFs(t)
     end
 end
 
-function plotSensorsWindow_RawVsFilt(raw, raw_filt, labels, pID, trialBaseName, t0, t1, showMarkers, subtitleTxt)
-
-    trialFields = string(fieldnames(raw.(pID)));
-
-    if any(strcmp(trialFields, trialBaseName))
-        trialField = trialBaseName;
-    else
-        hits = trialFields(contains(trialFields, trialBaseName, 'IgnoreCase', true));
-        if isempty(hits)
-            error("Trial '%s' not found in sensor data for %s.", trialBaseName, pID);
-        end
-        trialField = hits(end);
-    end
-
-    Xr = raw.(pID).(trialField);
-    Xf = raw_filt.(pID).(trialField);
-
-    timing_s = [];
-    timingLabel = [];
-    if showMarkers
-        base = regexprep(trialBaseName, "_\d+$", "");
-        if isfield(labels.(pID), base)
-            T = labels.(pID).(base);
-            timingLabel = T(:,1);
-            timing_s = T(:,2)/1000;
-        end
-    end
-
-    crop = @(M) M(M(:,1) >= t0 & M(:,1) <= t1, :);
-
-    Br = crop(Xr.Back);  Lr = crop(Xr.Left_Thigh);  Rr = crop(Xr.Right_Thigh);
-    Er = crop(Xr.ECG);   Gr = crop(Xr.GSS);
-
-    Bf = crop(Xf.Back);  Lf = crop(Xf.Left_Thigh);  Rf = crop(Xf.Right_Thigh);
-    Ef = crop(Xf.ECG);   Gf = crop(Xf.GSS);
-
-    aBr = vecnorm(Br(:,2:4),2,2); wBr = vecnorm(Br(:,5:7),2,2);
-    aLr = vecnorm(Lr(:,2:4),2,2); wLr = vecnorm(Lr(:,5:7),2,2);
-    aRr = vecnorm(Rr(:,2:4),2,2); wRr = vecnorm(Rr(:,5:7),2,2);
-
-    aBf = vecnorm(Bf(:,2:4),2,2); wBf = vecnorm(Bf(:,5:7),2,2);
-    aLf = vecnorm(Lf(:,2:4),2,2); wLf = vecnorm(Lf(:,5:7),2,2);
-    aRf = vecnorm(Rf(:,2:4),2,2); wRf = vecnorm(Rf(:,5:7),2,2);
-
-    figure('Color','w');
-    tl = tiledlayout(5,2,'TileSpacing','compact','Padding','compact');
-    title(tl, pID + " | " + trialField + " | " + subtitleTxt + sprintf(" (%.1f-%.1fs)", t0, t1));
-
-    ax11 = nexttile;
-    h1 = plot(Br(:,1), aBr); hold on;
-    h2 = plot(Br(:,1), wBr);
-    ylabel("Back |a| (m/s^2), |w| (deg/s)");
-    title("RAW");
-    addLines(timing_s, timingLabel, t0, t1);
-
-    ax12 = nexttile;
-    plot(Bf(:,1), aBf); hold on;
-    plot(Bf(:,1), wBf);
-    title("FILTERED");
-    addLines(timing_s, timingLabel, t0, t1);
-
-    lg = legend(ax11, [h1 h2], "|a|", "|w|", "Location", "northoutside", "Orientation", "horizontal");
-    lg.Box = "off";
-
-    ax21 = nexttile;
-    plot(Lr(:,1), aLr); hold on; plot(Lr(:,1), wLr);
-    ylabel("L thigh |a|, |w|");
-    addLines(timing_s, timingLabel, t0, t1);
-
-    ax22 = nexttile;
-    plot(Lf(:,1), aLf); hold on; plot(Lf(:,1), wLf);
-    addLines(timing_s, timingLabel, t0, t1);
-
-    ax31 = nexttile;
-    plot(Rr(:,1), aRr); hold on; plot(Rr(:,1), wRr);
-    ylabel("R thigh |a|, |w|");
-    addLines(timing_s, timingLabel, t0, t1);
-
-    ax32 = nexttile;
-    plot(Rf(:,1), aRf); hold on; plot(Rf(:,1), wRf);
-    addLines(timing_s, timingLabel, t0, t1);
-
-    ax41 = nexttile;
-    plot(Er(:,1), Er(:,2));
-    ylabel("ECG (V)");
-    addLines(timing_s, timingLabel, t0, t1);
-
-    ax42 = nexttile;
-    plot(Ef(:,1), Ef(:,2));
-    addLines(timing_s, timingLabel, t0, t1);
-
-    ax51 = nexttile;
-    plot(Gr(:,1), Gr(:,2));
-    ylabel("GSS / GSR (V)");
-    xlabel("Time (s)");
-    addLines(timing_s, timingLabel, t0, t1);
-
-    ax52 = nexttile;
-    plot(Gf(:,1), Gf(:,2));
-    xlabel("Time (s)");
-    addLines(timing_s, timingLabel, t0, t1);
-
-    linkaxes([ax11 ax12 ax21 ax22 ax31 ax32 ax41 ax42 ax51 ax52], 'x');
-end
-
-function addLines(timing_s, timingLabel, t0, t1)
-    if isempty(timing_s)
-        return;
-    end
-
-    inWin = timing_s >= t0 & timing_s <= t1;
-    ts = timing_s(inWin);
-    ls = timingLabel(inWin);
-
-    for i = 1:numel(ts)
-        xline(ts(i), "--", "L" + ls(i), "LabelOrientation", "horizontal");
-    end
-end
-
 function rawTrialField = resolveRawTrialField(rawParticipantStruct, labelTrialName)
-% Find matching raw trial field for a label trial name
 
     rawTrialField = "";
 
@@ -1177,31 +1090,6 @@ function tf = overlapsBuffered(w0, w1, intervals, buffer_s)
     end
 end
 
-function feat = extractSegmentFeatures(W)
-% W = [t ax ay az wx wy wz]
-
-    ax = W(:,2);
-    ay = W(:,3);
-    az = W(:,4);
-    wx = W(:,5);
-    wy = W(:,6);
-    wz = W(:,7);
-
-    amag = vecnorm(W(:,2:4),2,2);
-    wmag = vecnorm(W(:,5:7),2,2);
-
-    feat = [ ...
-        basic1DFeatures(ax), ...
-        basic1DFeatures(ay), ...
-        basic1DFeatures(az), ...
-        basic1DFeatures(wx), ...
-        basic1DFeatures(wy), ...
-        basic1DFeatures(wz), ...
-        basic1DFeatures(amag), ...
-        basic1DFeatures(wmag) ...
-        ];
-end
-
 function f = basic1DFeatures(x)
     f = [ ...
         mean(x), ...
@@ -1217,33 +1105,88 @@ function f = basic1DFeatures(x)
         ];
 end
 
-function featNames = getSegmentFeatureNames()
-    base = {'mean','std','min','max','range','rms','energy','median','iqr','mad'};
-    signals = {'ax','ay','az','wx','wy','wz','amag','wmag'};
+function featNames = getMultiSensorFeatureNames()
 
-    featNames = cell(1, numel(base)*numel(signals));
-    c = 1;
-    for s = 1:numel(signals)
-        for b = 1:numel(base)
-            featNames{c} = [signals{s} '_' base{b}];
-            c = c + 1;
+    imuBase = {'mean','std','min','max','range','rms','energy','median','iqr','mad'};
+    imuSignals = {'ax','ay','az','wx','wy','wz','amag','wmag'};
+
+    featNames = {};
+
+    sensorPrefixes = {'core','limb1','limb2'};
+    for s = 1:numel(sensorPrefixes)
+        for sig = 1:numel(imuSignals)
+            for b = 1:numel(imuBase)
+                featNames{end+1} = sprintf('%s_%s_%s', sensorPrefixes{s}, imuSignals{sig}, imuBase{b}); %#ok<AGROW>
+            end
+        end
+    end
+
+    oneDSignals = {'ecg','gss'};
+    for s = 1:numel(oneDSignals)
+        for b = 1:numel(imuBase)
+            featNames{end+1} = sprintf('%s_%s', oneDSignals{s}, imuBase{b}); %#ok<AGROW>
         end
     end
 end
 
+function submissionTables = buildSubmissionTables(resultTable)
+% Output format per row:
+% [start_time, end_time, label]
+% label:
+% 1 = NearFall
+% 2 = Fall
 
+    submissionTables = struct();
 
-function err = svmCVLoss(Xtr, Ytr, Xval, Yval)
-% Helper loss function for sequentialfs using ECOC SVM
+    participants = unique(resultTable.Participant);
 
-    t_local = templateSVM('KernelFunction','linear', ...
-                          'KernelScale','auto', ...
-                          'Standardize',false);
+    for p = 1:numel(participants)
+        pID = participants(p);
+        idxP = resultTable.Participant == pID;
+        Tpart = resultTable(idxP,:);
 
-    mdl_local = fitcecoc(Xtr, Ytr, ...
-        'Learners', t_local, ...
-        'Prior', 'uniform');
+        trials = unique(Tpart.Trial);
 
-    pred_local = predict(mdl_local, Xval);
-    err = mean(pred_local ~= Yval);
+        for t = 1:numel(trials)
+            tr = trials(t);
+            idxT = Tpart.Trial == tr;
+            Ttrial = Tpart(idxT,:);
+
+            [~, order] = sort(Ttrial.WindowStart_s);
+            Ttrial = Ttrial(order,:);
+
+            idxEvent = Ttrial.PredictedLabelNum == 1 | Ttrial.PredictedLabelNum == 2;
+            Tevent = Ttrial(idxEvent,:);
+
+            if isempty(Tevent)
+                submissionTables.(char(pID)).(matlab.lang.makeValidName(char(tr))) = zeros(0,3);
+                continue;
+            end
+
+            mergedRows = [];
+
+            curStart = Tevent.WindowStart_s(1);
+            curEnd   = Tevent.WindowEnd_s(1);
+            curLabel = Tevent.PredictedLabelNum(1);
+
+            for i = 2:height(Tevent)
+                nextStart = Tevent.WindowStart_s(i);
+                nextEnd   = Tevent.WindowEnd_s(i);
+                nextLabel = Tevent.PredictedLabelNum(i);
+
+                if nextLabel == curLabel && nextStart <= curEnd
+                    curEnd = max(curEnd, nextEnd);
+                else
+                    mergedRows(end+1,:) = [curStart, curEnd, curLabel]; %#ok<AGROW>
+                    curStart = nextStart;
+                    curEnd   = nextEnd;
+                    curLabel = nextLabel;
+                end
+            end
+
+            mergedRows(end+1,:) = [curStart, curEnd, curLabel];
+
+            submissionTables.(char(pID)).(matlab.lang.makeValidName(char(tr))) = mergedRows;
+        end
+    end
 end
