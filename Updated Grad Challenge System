@@ -17,6 +17,8 @@
 %   - Left_Thigh/Right_Thigh are preferred for limb sensors
 %   - Left_Arm/Right_Arm are used if thigh sensors are not available
 %   - ECG and GSS are also included in the feature vector
+%   - SVM uses PCA + RBF kernel
+%   - Test data is unlabeled, so no test confusion matrix is produced
 
 clear; clc; close all;
 
@@ -24,8 +26,8 @@ clear; clc; close all;
 %% 1) USER PATHS
 %% ============================================================
 
-trainFilePath = "/Users/sophiakatramadakis/Documents/MATLAB/GrandChallengeData.mat";    % <-- update if needed
-testFilePath  = "/Applications/MATLAB/GrandChallengeTestData.mat";                      % <-- update if needed
+trainFilePath = "/Users/sophiakatramadakis/Documents/MATLAB/GrandChallengeData.mat";
+testFilePath  = "/Applications/MATLAB/GrandChallengeTestData.mat";
 
 %% ============================================================
 %% 2) LOAD TRAINING DATA
@@ -80,24 +82,33 @@ disp(fieldnames(raw_train))
 %% 5) FILTER SETTINGS
 %% ============================================================
 
+IMU.filter_order = 4;
 IMU.lowpass_fc = 20;      % Hz
 
+ECG.filter_order = 4;
 ECG.bandpass_f1 = 0.5;    % Hz
 ECG.bandpass_f2 = 150;    % Hz
 ECG.use_notch   = true;
 ECG.notch_f1    = 50;     % Hz
 ECG.notch_f2    = 70;     % Hz
 
+GSR.filter_order = 4;
 GSR.lowpass_fc = 1;       % Hz
 
 rng(1);
 
 adlWindow_s = 1.0;
 adlStep_s   = 1.0;
-eventBuffer_s = 0.25;
-numTrees = 200;
+eventBuffer_s = 0.5;
+numTrees = 300;
+rfMinLeafSize = 5;
 minSamplesPerSegment = 20;
 kfolds = 5;
+
+freqAmpRatioSplitHz = 3;
+
+targetVariancePct = 95;
+maxPCAComponents = 42;
 
 %% ============================================================
 %% SECTION A - FILTER TRAINING DATA
@@ -115,24 +126,24 @@ for p = 1:numel(participants_train)
         X = raw_train.(pID).(tr);
 
         if isfield(X,"Back")
-            raw_train_filt.(pID).(tr).Back = filterIMU_Matrix(X.Back, IMU.lowpass_fc);
+            raw_train_filt.(pID).(tr).Back = filterIMU_Matrix(X.Back, IMU.lowpass_fc, IMU.filter_order);
         end
 
         if isfield(X,"Left_Thigh")
-            raw_train_filt.(pID).(tr).Left_Thigh = filterIMU_Matrix(X.Left_Thigh, IMU.lowpass_fc);
+            raw_train_filt.(pID).(tr).Left_Thigh = filterIMU_Matrix(X.Left_Thigh, IMU.lowpass_fc, IMU.filter_order);
         end
 
         if isfield(X,"Right_Thigh")
-            raw_train_filt.(pID).(tr).Right_Thigh = filterIMU_Matrix(X.Right_Thigh, IMU.lowpass_fc);
+            raw_train_filt.(pID).(tr).Right_Thigh = filterIMU_Matrix(X.Right_Thigh, IMU.lowpass_fc, IMU.filter_order);
         end
 
         if isfield(X,"ECG")
             raw_train_filt.(pID).(tr).ECG = filterECG_Matrix(X.ECG, ECG.bandpass_f1, ECG.bandpass_f2, ...
-                ECG.use_notch, ECG.notch_f1, ECG.notch_f2);
+                ECG.use_notch, ECG.notch_f1, ECG.notch_f2, ECG.filter_order);
         end
 
         if isfield(X,"GSS")
-            raw_train_filt.(pID).(tr).GSS = filterGSR_Matrix(X.GSS, GSR.lowpass_fc);
+            raw_train_filt.(pID).(tr).GSS = filterGSR_Matrix(X.GSS, GSR.lowpass_fc, GSR.filter_order);
         end
     end
 end
@@ -155,36 +166,36 @@ for p = 1:numel(participants_test)
         X = test_data.(pID).(tr);
 
         if isfield(X,"Back")
-            test_data_filt.(pID).(tr).Back = filterIMU_Matrix(X.Back, IMU.lowpass_fc);
+            test_data_filt.(pID).(tr).Back = filterIMU_Matrix(X.Back, IMU.lowpass_fc, IMU.filter_order);
         end
 
         if isfield(X,"Sternum")
-            test_data_filt.(pID).(tr).Sternum = filterIMU_Matrix(X.Sternum, IMU.lowpass_fc);
+            test_data_filt.(pID).(tr).Sternum = filterIMU_Matrix(X.Sternum, IMU.lowpass_fc, IMU.filter_order);
         end
 
         if isfield(X,"Left_Thigh")
-            test_data_filt.(pID).(tr).Left_Thigh = filterIMU_Matrix(X.Left_Thigh, IMU.lowpass_fc);
+            test_data_filt.(pID).(tr).Left_Thigh = filterIMU_Matrix(X.Left_Thigh, IMU.lowpass_fc, IMU.filter_order);
         end
 
         if isfield(X,"Right_Thigh")
-            test_data_filt.(pID).(tr).Right_Thigh = filterIMU_Matrix(X.Right_Thigh, IMU.lowpass_fc);
+            test_data_filt.(pID).(tr).Right_Thigh = filterIMU_Matrix(X.Right_Thigh, IMU.lowpass_fc, IMU.filter_order);
         end
 
         if isfield(X,"Left_Arm")
-            test_data_filt.(pID).(tr).Left_Arm = filterIMU_Matrix(X.Left_Arm, IMU.lowpass_fc);
+            test_data_filt.(pID).(tr).Left_Arm = filterIMU_Matrix(X.Left_Arm, IMU.lowpass_fc, IMU.filter_order);
         end
 
         if isfield(X,"Right_Arm")
-            test_data_filt.(pID).(tr).Right_Arm = filterIMU_Matrix(X.Right_Arm, IMU.lowpass_fc);
+            test_data_filt.(pID).(tr).Right_Arm = filterIMU_Matrix(X.Right_Arm, IMU.lowpass_fc, IMU.filter_order);
         end
 
         if isfield(X,"ECG")
             test_data_filt.(pID).(tr).ECG = filterECG_Matrix(X.ECG, ECG.bandpass_f1, ECG.bandpass_f2, ...
-                ECG.use_notch, ECG.notch_f1, ECG.notch_f2);
+                ECG.use_notch, ECG.notch_f1, ECG.notch_f2, ECG.filter_order);
         end
 
         if isfield(X,"GSS")
-            test_data_filt.(pID).(tr).GSS = filterGSR_Matrix(X.GSS, GSR.lowpass_fc);
+            test_data_filt.(pID).(tr).GSS = filterGSR_Matrix(X.GSS, GSR.lowpass_fc, GSR.filter_order);
         end
     end
 end
@@ -203,7 +214,8 @@ disp("Event intervals built from TRAINING labels.");
 %% ============================================================
 
 [XTrain, YTrain, trainParticipant, trainTrial] = buildFeatureMatrixFromLabeledSet( ...
-    raw_train_filt, labels_train, eventStruct_train, adlWindow_s, adlStep_s, eventBuffer_s, minSamplesPerSegment);
+    raw_train_filt, labels_train, eventStruct_train, adlWindow_s, adlStep_s, ...
+    eventBuffer_s, minSamplesPerSegment, freqAmpRatioSplitHz);
 
 featNames = getMultiSensorFeatureNames();
 YTrain_cat = categorical(YTrain, [0 1 2], {'ADL','NearFall','Fall'});
@@ -211,6 +223,7 @@ YTrain_cat = categorical(YTrain, [0 1 2], {'ADL','NearFall','Fall'});
 fprintf("\nOverall TRAINING class counts:\n");
 disp(countcats(YTrain_cat))
 disp(categories(YTrain_cat))
+fprintf("Feature matrix size: %d samples x %d features\n", size(XTrain,1), size(XTrain,2));
 
 %% Balance training data
 idxADL  = find(YTrain_cat == 'ADL');
@@ -260,6 +273,7 @@ testWinStart = [];
 testWinEnd = [];
 
 participants_test = fieldnames(test_data_filt);
+expectedFeatLen = getExpectedFeatureLength();
 
 for p = 1:numel(participants_test)
 
@@ -278,7 +292,6 @@ for p = 1:numel(participants_test)
             continue;
         end
 
-        % choose a reference time vector from the core sensor if possible
         refField = sensorMap.core;
         if strlength(refField) == 0
             refField = sensorMap.limb1;
@@ -311,9 +324,10 @@ for p = 1:numel(participants_test)
             w0 = winStarts(w);
             w1 = w0 + adlWindow_s;
 
-            feat = extractMultiSensorWindowFeatures(test_data_filt.(pID).(tr), sensorMap, w0, w1, minSamplesPerSegment);
+            feat = extractMultiSensorWindowFeatures(test_data_filt.(pID).(tr), sensorMap, ...
+                w0, w1, minSamplesPerSegment, freqAmpRatioSplitHz);
 
-            if isempty(feat)
+            if isempty(feat) || numel(feat) ~= expectedFeatLen
                 continue;
             end
 
@@ -327,6 +341,7 @@ for p = 1:numel(participants_test)
 end
 
 fprintf("\nTotal TEST windows created from unlabeled test data: %d\n", size(XTest,1));
+fprintf("Test feature matrix size: %d samples x %d features\n", size(XTest,1), size(XTest,2));
 
 %% ============================================================
 %% SECTION F - RANDOM FOREST
@@ -335,7 +350,8 @@ fprintf("\nTotal TEST windows created from unlabeled test data: %d\n", size(XTes
 rfModel = TreeBagger(numTrees, XTrain_bal, YTrain_bal, ...
     'Method', 'classification', ...
     'OOBPrediction', 'On', ...
-    'OOBPredictorImportance', 'On');
+    'OOBPredictorImportance', 'On', ...
+    'MinLeafSize', rfMinLeafSize);
 
 disp("Random Forest trained.");
 
@@ -384,7 +400,7 @@ importance = rfModel.OOBPermutedPredictorDeltaError(:);
 disp("Top Random Forest feature importances:")
 topN = min(15, numel(idxSort));
 for i = 1:topN
-    fprintf("%2d. %-35s %.4f\n", i, featNames{idxSort(i)}, importanceSorted(i));
+    fprintf("%2d. %-45s %.4f\n", i, featNames{idxSort(i)}, importanceSorted(i));
 end
 
 figure;
@@ -413,7 +429,14 @@ for p = 1:numel(rfParticipants)
         tr = rfTrials{t};
         Tsub = rfSubmissionTables.(pID).(tr);
 
-        outName = sprintf("RF_%s_%s.csv", pID, tr);
+        tok = regexp(char(tr), '^(T\d{2}[A-Z]?)', 'tokens', 'once');
+        if isempty(tok)
+            trialIDshort = char(tr);
+        else
+            trialIDshort = tok{1};
+        end
+
+        outName = sprintf("%s_%s.csv", pID, trialIDshort);
         writematrix(Tsub, outName);
     end
 end
@@ -426,11 +449,26 @@ mu_train = mean(XTrain_bal, 1);
 sig_train = std(XTrain_bal, 0, 1);
 sig_train(sig_train == 0) = 1;
 
-XTrain_svm = (XTrain_bal - mu_train) ./ sig_train;
-XTest_svm  = (XTest      - mu_train) ./ sig_train;
+XTrain_svm_std = (XTrain_bal - mu_train) ./ sig_train;
+XTest_svm_std  = (XTest      - mu_train) ./ sig_train;
+
+[coeff, scoreTrain, ~, ~, explained, mu_pca] = pca(XTrain_svm_std, 'Economy', true);
+cumExplained = cumsum(explained);
+nComp95 = find(cumExplained >= targetVariancePct, 1, 'first');
+if isempty(nComp95)
+    nComp95 = size(scoreTrain,2);
+end
+nComp = min(nComp95, maxPCAComponents);
+
+fprintf("\nPCA components for SVM: %d (%.2f%% variance retained)\n", ...
+    nComp, cumExplained(nComp));
+
+XTrain_svm = scoreTrain(:,1:nComp);
+XTest_centered = XTest_svm_std - mu_pca;
+XTest_svm = XTest_centered * coeff(:,1:nComp);
 
 t_svm = templateSVM( ...
-    'KernelFunction','linear', ...
+    'KernelFunction','gaussian', ...
     'KernelScale','auto', ...
     'Standardize',false);
 
@@ -495,18 +533,41 @@ for p = 1:numel(svmParticipants)
         tr = svmTrials{t};
         Tsub = svmSubmissionTables.(pID).(tr);
 
-        outName = sprintf("SVM_%s_%s.csv", pID, tr);
+        tok = regexp(char(tr), '^(T\d{2}[A-Z]?)', 'tokens', 'once');
+        if isempty(tok)
+            trialIDshort = char(tr);
+        else
+            trialIDshort = tok{1};
+        end
+
+        outName = sprintf("%s_%s.csv", pID, trialIDshort);
         writematrix(Tsub, outName);
     end
 end
 
+%%
+test_data.P1544.T07_Stairs.Sternum(1:10,1)
+
+%%
+t = test_data.P1544.T07_Stairs.Sternum(:,1);
+dt = diff(t);
+[min(dt) median(dt) max(dt)]
+
+%%
+t = test_data.P1544.T07_Stairs.Sternum(:,1);
+Fs = 1/median(diff(t))
+
+%%
+t = test_data.P1544.T07_Stairs.Sternum(:,1);
+fprintf('Start time: %.3f\n', t(1));
+fprintf('End time: %.3f\n', t(end));
+fprintf('Median dt: %.6f\n', median(diff(t)));
+fprintf('Estimated Fs: %.3f Hz\n', 1/median(diff(t)));
 %% ============================================================
 %% LOCAL FUNCTIONS
 %% ============================================================
 
 function rawStruct = autoFindRawSensorStruct(S, labelsRef)
-% Find the raw sensor struct using participant IDs from labels
-
     rawStruct = [];
 
     participantIDs = fieldnames(labelsRef);
@@ -574,9 +635,6 @@ function rawStruct = autoFindRawSensorStruct(S, labelsRef)
 end
 
 function eventStruct = buildEventStruct(labels)
-% NearFall rows stored as [t0 t1 termLabel]
-% Fall rows stored as [t0 t1]
-
     eventStruct = struct();
     participants_labels = fieldnames(labels);
 
@@ -657,13 +715,14 @@ function eventStruct = buildEventStruct(labels)
     end
 end
 
-function [X, Y, sampleParticipant, sampleTrial] = buildFeatureMatrixFromLabeledSet(raw_filt, labels, eventStruct, adlWindow_s, adlStep_s, eventBuffer_s, minSamplesPerSegment)
+function [X, Y, sampleParticipant, sampleTrial] = buildFeatureMatrixFromLabeledSet(raw_filt, labels, eventStruct, adlWindow_s, adlStep_s, eventBuffer_s, minSamplesPerSegment, freqAmpRatioSplitHz)
 
     X = [];
     Y = [];
     sampleParticipant = strings(0,1);
     sampleTrial = strings(0,1);
 
+    expectedFeatLen = getExpectedFeatureLength();
     participants = fieldnames(labels);
 
     for p = 1:numel(participants)
@@ -729,8 +788,10 @@ function [X, Y, sampleParticipant, sampleTrial] = buildFeatureMatrixFromLabeledS
                 t0 = nearFalls(i,1);
                 t1 = nearFalls(i,2);
 
-                feat = extractMultiSensorWindowFeatures(raw_filt.(pID).(rawTrialField), sensorMap, t0, t1, minSamplesPerSegment);
-                if isempty(feat)
+                feat = extractMultiSensorWindowFeatures(raw_filt.(pID).(rawTrialField), sensorMap, ...
+                    t0, t1, minSamplesPerSegment, freqAmpRatioSplitHz);
+
+                if isempty(feat) || numel(feat) ~= expectedFeatLen
                     continue;
                 end
 
@@ -744,8 +805,10 @@ function [X, Y, sampleParticipant, sampleTrial] = buildFeatureMatrixFromLabeledS
                 t0 = falls(i,1);
                 t1 = falls(i,2);
 
-                feat = extractMultiSensorWindowFeatures(raw_filt.(pID).(rawTrialField), sensorMap, t0, t1, minSamplesPerSegment);
-                if isempty(feat)
+                feat = extractMultiSensorWindowFeatures(raw_filt.(pID).(rawTrialField), sensorMap, ...
+                    t0, t1, minSamplesPerSegment, freqAmpRatioSplitHz);
+
+                if isempty(feat) || numel(feat) ~= expectedFeatLen
                     continue;
                 end
 
@@ -777,8 +840,10 @@ function [X, Y, sampleParticipant, sampleTrial] = buildFeatureMatrixFromLabeledS
                     continue;
                 end
 
-                feat = extractMultiSensorWindowFeatures(raw_filt.(pID).(rawTrialField), sensorMap, w0, w1, minSamplesPerSegment);
-                if isempty(feat)
+                feat = extractMultiSensorWindowFeatures(raw_filt.(pID).(rawTrialField), sensorMap, ...
+                    w0, w1, minSamplesPerSegment, freqAmpRatioSplitHz);
+
+                if isempty(feat) || numel(feat) ~= expectedFeatLen
                     continue;
                 end
 
@@ -792,10 +857,6 @@ function [X, Y, sampleParticipant, sampleTrial] = buildFeatureMatrixFromLabeledS
 end
 
 function sensorMap = getSensorMap(trialStruct)
-% Build a consistent sensor slot mapping:
-% core  = Back preferred, otherwise Sternum
-% limb1 = Left_Thigh preferred, otherwise Left_Arm
-% limb2 = Right_Thigh preferred, otherwise Right_Arm
 
     sensorMap = struct();
     sensorMap.core  = "";
@@ -838,85 +899,53 @@ function sensorMap = getSensorMap(trialStruct)
                        strlength(sensorMap.gss) > 0;
 end
 
-function feat = extractMultiSensorWindowFeatures(trialStruct, sensorMap, t0, t1, minSamplesPerSegment)
-% Concatenate features from:
-% core IMU + limb1 IMU + limb2 IMU + ECG + GSS
-% Returns [] if required windowing fails for all usable sensors
+function feat = extractMultiSensorWindowFeatures(trialStruct, sensorMap, t0, t1, minSamplesPerSegment, freqAmpRatioSplitHz)
 
     feat = [];
 
-    % Core IMU
-    if strlength(sensorMap.core) > 0
-        M = trialStruct.(sensorMap.core);
-        idx = M(:,1) >= t0 & M(:,1) <= t1;
-        if sum(idx) >= minSamplesPerSegment
-            feat = [feat, extractIMUFeatures(M(idx,:))];
-        else
-            feat = [feat, nan(1,80)];
-        end
-    else
-        feat = [feat, nan(1,80)];
-    end
+    feat = [feat, extractSensorBlock(trialStruct, sensorMap.core,  t0, t1, minSamplesPerSegment, freqAmpRatioSplitHz, "imu")];
+    feat = [feat, extractSensorBlock(trialStruct, sensorMap.limb1, t0, t1, minSamplesPerSegment, freqAmpRatioSplitHz, "imu")];
+    feat = [feat, extractSensorBlock(trialStruct, sensorMap.limb2, t0, t1, minSamplesPerSegment, freqAmpRatioSplitHz, "imu")];
+    feat = [feat, extractSensorBlock(trialStruct, sensorMap.ecg,   t0, t1, minSamplesPerSegment, freqAmpRatioSplitHz, "1d")];
+    feat = [feat, extractSensorBlock(trialStruct, sensorMap.gss,   t0, t1, minSamplesPerSegment, freqAmpRatioSplitHz, "1d")];
 
-    % Limb1 IMU
-    if strlength(sensorMap.limb1) > 0
-        M = trialStruct.(sensorMap.limb1);
-        idx = M(:,1) >= t0 & M(:,1) <= t1;
-        if sum(idx) >= minSamplesPerSegment
-            feat = [feat, extractIMUFeatures(M(idx,:))];
-        else
-            feat = [feat, nan(1,80)];
-        end
-    else
-        feat = [feat, nan(1,80)];
-    end
-
-    % Limb2 IMU
-    if strlength(sensorMap.limb2) > 0
-        M = trialStruct.(sensorMap.limb2);
-        idx = M(:,1) >= t0 & M(:,1) <= t1;
-        if sum(idx) >= minSamplesPerSegment
-            feat = [feat, extractIMUFeatures(M(idx,:))];
-        else
-            feat = [feat, nan(1,80)];
-        end
-    else
-        feat = [feat, nan(1,80)];
-    end
-
-    % ECG
-    if strlength(sensorMap.ecg) > 0
-        M = trialStruct.(sensorMap.ecg);
-        idx = M(:,1) >= t0 & M(:,1) <= t1;
-        if sum(idx) >= minSamplesPerSegment
-            feat = [feat, extract1DSignalFeatures(M(idx,2))];
-        else
-            feat = [feat, nan(1,10)];
-        end
-    else
-        feat = [feat, nan(1,10)];
-    end
-
-    % GSS
-    if strlength(sensorMap.gss) > 0
-        M = trialStruct.(sensorMap.gss);
-        idx = M(:,1) >= t0 & M(:,1) <= t1;
-        if sum(idx) >= minSamplesPerSegment
-            feat = [feat, extract1DSignalFeatures(M(idx,2))];
-        else
-            feat = [feat, nan(1,10)];
-        end
-    else
-        feat = [feat, nan(1,10)];
-    end
-
-    % Replace NaNs with column-neutral zeros for model compatibility
+    feat = reshape(feat, 1, []);
     feat(isnan(feat)) = 0;
 end
 
-function feat = extractIMUFeatures(W)
-% W = [t ax ay az wx wy wz]
+function blockFeat = extractSensorBlock(trialStruct, fieldName, t0, t1, minSamplesPerSegment, freqAmpRatioSplitHz, mode)
 
+    if mode == "imu"
+        emptyLen = 104;
+    else
+        emptyLen = 13;
+    end
+
+    if strlength(fieldName) == 0
+        blockFeat = nan(1, emptyLen);
+        return;
+    end
+
+    M = trialStruct.(fieldName);
+    idx = M(:,1) >= t0 & M(:,1) <= t1;
+
+    if sum(idx) < minSamplesPerSegment
+        blockFeat = nan(1, emptyLen);
+        return;
+    end
+
+    if mode == "imu"
+        blockFeat = extractIMUFeatures(M(idx,:), freqAmpRatioSplitHz);
+    else
+        blockFeat = extract1DSignalFeatures(M(idx,1), M(idx,2), freqAmpRatioSplitHz);
+    end
+
+    blockFeat = reshape(blockFeat, 1, []);
+end
+
+function feat = extractIMUFeatures(W, freqAmpRatioSplitHz)
+
+    t = W(:,1);
     ax = W(:,2);
     ay = W(:,3);
     az = W(:,4);
@@ -928,19 +957,105 @@ function feat = extractIMUFeatures(W)
     wmag = vecnorm(W(:,5:7),2,2);
 
     feat = [ ...
-        basic1DFeatures(ax), ...
-        basic1DFeatures(ay), ...
-        basic1DFeatures(az), ...
-        basic1DFeatures(wx), ...
-        basic1DFeatures(wy), ...
-        basic1DFeatures(wz), ...
-        basic1DFeatures(amag), ...
-        basic1DFeatures(wmag) ...
+        extract1DSignalFeatures(t, ax, freqAmpRatioSplitHz), ...
+        extract1DSignalFeatures(t, ay, freqAmpRatioSplitHz), ...
+        extract1DSignalFeatures(t, az, freqAmpRatioSplitHz), ...
+        extract1DSignalFeatures(t, wx, freqAmpRatioSplitHz), ...
+        extract1DSignalFeatures(t, wy, freqAmpRatioSplitHz), ...
+        extract1DSignalFeatures(t, wz, freqAmpRatioSplitHz), ...
+        extract1DSignalFeatures(t, amag, freqAmpRatioSplitHz), ...
+        extract1DSignalFeatures(t, wmag, freqAmpRatioSplitHz) ...
         ];
+
+    feat = reshape(feat, 1, []);
 end
 
-function feat = extract1DSignalFeatures(x)
-    feat = basic1DFeatures(x);
+function feat = extract1DSignalFeatures(t, x, freqAmpRatioSplitHz)
+
+    t = t(:);
+    x = x(:);
+
+    feat = [ ...
+        basic1DFeatures(x), ...
+        computeMeanFrequency(t, x), ...
+        computeDominantFrequency(t, x), ...
+        computeAmplitudeRatio(t, x, freqAmpRatioSplitHz) ...
+        ];
+
+    feat = reshape(feat, 1, []);
+end
+
+function mf = computeMeanFrequency(t, x)
+    [f, A] = getOneSidedSpectrum(t, x);
+    if isempty(f) || isempty(A) || sum(A) == 0
+        mf = 0;
+        return;
+    end
+    mf = sum(f .* A) / sum(A);
+end
+
+function df = computeDominantFrequency(t, x)
+    [f, A] = getOneSidedSpectrum(t, x);
+    if isempty(f) || isempty(A)
+        df = 0;
+        return;
+    end
+    [~, idx] = max(A);
+    df = f(idx);
+end
+
+function ar = computeAmplitudeRatio(t, x, splitHz)
+    [f, A] = getOneSidedSpectrum(t, x);
+    if isempty(f) || isempty(A)
+        ar = 0;
+        return;
+    end
+
+    lowAmp = sum(A(f <= splitHz));
+    highAmp = sum(A(f > splitHz));
+
+    if highAmp == 0
+        ar = lowAmp;
+    else
+        ar = lowAmp / highAmp;
+    end
+end
+
+function [f, A] = getOneSidedSpectrum(t, x)
+
+    t = t(:);
+    x = x(:);
+
+    if numel(x) < 4 || numel(t) < 4
+        f = [];
+        A = [];
+        return;
+    end
+
+    dt = diff(t);
+    dt = dt(isfinite(dt) & dt > 0);
+
+    if isempty(dt)
+        f = [];
+        A = [];
+        return;
+    end
+
+    Fs = 1 / median(dt);
+    N = numel(x);
+
+    x = x - mean(x, 'omitnan');
+
+    X = fft(x);
+    P2 = abs(X / N);
+    P1 = P2(1:floor(N/2)+1);
+
+    if numel(P1) > 2
+        P1(2:end-1) = 2 * P1(2:end-1);
+    end
+
+    f = Fs * (0:floor(N/2))' / N;
+    A = P1(:);
 end
 
 function intervalsOut = filterUsableIntervals(intervalsIn, t, minSamplesPerSegment)
@@ -963,8 +1078,7 @@ function intervalsOut = filterUsableIntervals(intervalsIn, t, minSamplesPerSegme
     end
 end
 
-function M_f = filterIMU_Matrix(M, fc_lowpass)
-% M is Nx7: [t ax ay az wx wy wz]
+function M_f = filterIMU_Matrix(M, fc_lowpass, filtOrder)
 
     t = M(:,1);
     sig = M(:,2:7);
@@ -979,14 +1093,13 @@ function M_f = filterIMU_Matrix(M, fc_lowpass)
     Wn = fc_lowpass/(Fs/2);
     Wn = min(max(Wn, 0.0001), 0.9999);
 
-    [b,a] = butter(2, Wn, 'low');
+    [b,a] = butter(filtOrder, Wn, 'low');
     sig_f = filtfilt(b,a,sig);
 
     M_f = [t sig_f];
 end
 
-function M_f = filterECG_Matrix(M, f1, f2, use_notch, notch_f1, notch_f2)
-% M is Nx2: [t ecg]
+function M_f = filterECG_Matrix(M, f1, f2, use_notch, notch_f1, notch_f2, filtOrder)
 
     t = M(:,1);
     x = M(:,2);
@@ -1002,7 +1115,7 @@ function M_f = filterECG_Matrix(M, f1, f2, use_notch, notch_f1, notch_f2)
     Wn(1) = max(Wn(1), 0.0001);
     Wn(2) = min(Wn(2), 0.9999);
 
-    [bBP,aBP] = butter(2, Wn, 'bandpass');
+    [bBP,aBP] = butter(filtOrder, Wn, 'bandpass');
     x_f = filtfilt(bBP,aBP,x);
 
     if use_notch
@@ -1011,7 +1124,7 @@ function M_f = filterECG_Matrix(M, f1, f2, use_notch, notch_f1, notch_f2)
         WnN(2) = min(WnN(2), 0.9999);
 
         if WnN(2) > WnN(1)
-            [bN,aN] = butter(2, WnN, 'stop');
+            [bN,aN] = butter(filtOrder, WnN, 'stop');
             x_f = filtfilt(bN,aN,x_f);
         end
     end
@@ -1019,8 +1132,7 @@ function M_f = filterECG_Matrix(M, f1, f2, use_notch, notch_f1, notch_f2)
     M_f = [t x_f];
 end
 
-function M_f = filterGSR_Matrix(M, fc_lowpass)
-% M is Nx2: [t gss]
+function M_f = filterGSR_Matrix(M, fc_lowpass, filtOrder)
 
     t = M(:,1);
     x = M(:,2);
@@ -1035,7 +1147,7 @@ function M_f = filterGSR_Matrix(M, fc_lowpass)
     Wn = fc_lowpass/(Fs/2);
     Wn = min(max(Wn, 0.0001), 0.9999);
 
-    [b,a] = butter(2, Wn, 'low');
+    [b,a] = butter(filtOrder, Wn, 'low');
     x_f = filtfilt(b,a,x);
 
     M_f = [t x_f];
@@ -1091,23 +1203,31 @@ function tf = overlapsBuffered(w0, w1, intervals, buffer_s)
 end
 
 function f = basic1DFeatures(x)
+
+    x = x(:);
+
     f = [ ...
-        mean(x), ...
-        std(x), ...
+        mean(x, 'omitnan'), ...
+        std(x, 0, 'omitnan'), ...
         min(x), ...
         max(x), ...
         range(x), ...
         rms(x), ...
-        sum(x.^2)/numel(x), ...
-        median(x), ...
+        sum(x.^2) / numel(x), ...
+        median(x, 'omitnan'), ...
         iqr(x), ...
         mad(x,1) ...
         ];
+
+    f = reshape(f, 1, []);
 end
 
 function featNames = getMultiSensorFeatureNames()
 
-    imuBase = {'mean','std','min','max','range','rms','energy','median','iqr','mad'};
+    timeBase = {'mean','std','min','max','range','rms','energy','median','iqr','mad'};
+    freqBase = {'meanfreq','domfreq','ampratio'};
+    base = [timeBase, freqBase];
+
     imuSignals = {'ax','ay','az','wx','wy','wz','amag','wmag'};
 
     featNames = {};
@@ -1115,26 +1235,25 @@ function featNames = getMultiSensorFeatureNames()
     sensorPrefixes = {'core','limb1','limb2'};
     for s = 1:numel(sensorPrefixes)
         for sig = 1:numel(imuSignals)
-            for b = 1:numel(imuBase)
-                featNames{end+1} = sprintf('%s_%s_%s', sensorPrefixes{s}, imuSignals{sig}, imuBase{b}); %#ok<AGROW>
+            for b = 1:numel(base)
+                featNames{end+1} = sprintf('%s_%s_%s', sensorPrefixes{s}, imuSignals{sig}, base{b}); %#ok<AGROW>
             end
         end
     end
 
     oneDSignals = {'ecg','gss'};
     for s = 1:numel(oneDSignals)
-        for b = 1:numel(imuBase)
-            featNames{end+1} = sprintf('%s_%s', oneDSignals{s}, imuBase{b}); %#ok<AGROW>
+        for b = 1:numel(base)
+            featNames{end+1} = sprintf('%s_%s', oneDSignals{s}, base{b}); %#ok<AGROW>
         end
     end
 end
 
+function nFeat = getExpectedFeatureLength()
+    nFeat = 3*104 + 13 + 13;  % 338
+end
+
 function submissionTables = buildSubmissionTables(resultTable)
-% Output format per row:
-% [start_time, end_time, label]
-% label:
-% 1 = NearFall
-% 2 = Fall
 
     submissionTables = struct();
 
@@ -1185,7 +1304,6 @@ function submissionTables = buildSubmissionTables(resultTable)
             end
 
             mergedRows(end+1,:) = [curStart, curEnd, curLabel];
-
             submissionTables.(char(pID)).(matlab.lang.makeValidName(char(tr))) = mergedRows;
         end
     end
